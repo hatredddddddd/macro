@@ -1,0 +1,1012 @@
+-- Cameraman Tower Defense macro for Matcha
+--
+-- QUICK START (all in the "CTD Macro" menu tab)
+--   1. Stand where you want your starter towers, click "Slot 5 - create place here".
+--   2. Stand at your mid-game area, click "Slot 1 - create place here".
+--   3. Click Start (or press F8). Done.
+--
+-- "Towers per click" sliders set how many towers each button records (slot 1 = 9, slot 5 = 2).
+
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+
+local CFG = {
+    SlotKeys    = { 0x31, 0x32, 0x33, 0x34, 0x35, 0x36 },  -- hotbar keys 1-6
+    UpgradeKey  = 0x45,                                    -- "E"
+    CancelKey   = nil,                                     -- Q deletes units in this game, so no cancel key is pressed
+    StarterSlot = 5,                                       -- always placed first
+    -- how many towers one F-key press records (placed in a grid around you)
+    Counts      = { [1] = 9, [2] = 1, [3] = 1, [4] = 1, [5] = 2, [6] = 1 },
+    -- placement cost per slot
+    Costs       = { [1] = 300, [2] = 1000, [3] = 1000, [4] = 200, [5] = 180 },
+    SpotsFile   = "ctd_spots.txt",
+    ReplayWords = { "replay", "play again", "retry", "restart" },
+}
+
+local settings = {
+    spacing = 4,          -- studs between towers in a recorded group
+    placeDelay = 1,       -- seconds after each placement
+    upgradeEvery = 4,     -- seconds between upgrade passes
+    upgradesPerPass = 1,
+    roundDelay = 6,       -- seconds to wait after clicking replay
+    insetY = 58,          -- GUI inset for the replay click
+    autostart = false,    -- start the macro automatically when the script loads
+    groupMode = false,    -- false: one tower exactly where you stand; true: auto-grid groups
+    groundOffset = 3,     -- studs below your character's center where the placement click lands
+    tpSet = false,        -- a teleport spot has been saved
+    tpX = 0, tpY = 0, tpZ = 0,
+    tpEnabled = false,    -- teleport to the spot at the start of each round
+    autoSkip = false,     -- click the "skip wave" button when it shows
+    useReplayRemote = true, -- fire the PlayAgain remote instead of clicking the Replay button
+    modeVoteEnabled = false, -- vote for a mode with the ModeVote remote at round start
+    modeVoteArg = "",     -- value passed to ModeVote:FireServer (text, number, true/false); empty = no argument
+    modeVoteAfter = 8,    -- seconds after joining the server / starting a round before voting
+    timedPlayAgain = true, -- fire PlayAgain on a timer instead of waiting for the Replay button
+    playAgainAfter = 386, -- seconds after the round starts (386 = 6:26)
+    autoSpeed = false,    -- set game speed (default 1.5x) through the ChangeSpeed remote
+    gameSpeed = 1.5,      -- speed value sent to the remote
+    skipEvery = 2,        -- seconds between skip checks
+    camSet = false,       -- a camera view has been saved
+    camPX = 0, camPY = 0, camPZ = 0,   -- saved camera position
+    camLX = 0, camLY = 0, camLZ = -1,  -- saved camera look direction
+    camFov = 0,           -- saved field of view (0 = don't change)
+    camEnabled = false,   -- restore the camera view at round start and before placing
+    camLock = false,      -- hold the saved camera view constantly (fixed camera)
+    camAuto = true,       -- input-based camera reset: zoom all the way out, then look down
+    zoomNotches = 20,     -- scroll-wheel notches used to zoom out
+    pitchDrag = 600,      -- pixels of right-mouse drag used to tilt the camera down
+    zoomReverse = false,  -- flip scroll direction if the camera zooms in instead
+    pitchReverse = false, -- flip drag direction if the camera looks up instead
+}
+
+local spots = {}    -- { slot, pos, placed }
+local history = {}  -- group sizes, for undo
+local running = false
+local status = "Idle"
+local roundStart = tick()  -- when this server/round began (script load, new server, or replay)
+local voteDone = false     -- mode vote already sent for this round
+local runGen = 0           -- bumps on every start so an old loop can't keep running
+
+---------------------------------------------------------------- persistence
+local function saveSpots()
+    local lines = {}
+    for _, s in ipairs(spots) do
+        lines[#lines + 1] = string.format("%d,%.3f,%.3f,%.3f", s.slot, s.pos.X, s.pos.Y, s.pos.Z)
+    end
+    local ok, err = pcall(writefile, CFG.SpotsFile, table.concat(lines, "\n"))
+    if not ok then notify("Could not save spots: " .. tostring(err), "CTD Macro", 5) end
+end
+
+local function loadSpots()
+    local loaded = {}
+    local ok, err = pcall(function()
+        if not isfile(CFG.SpotsFile) then return end
+        local text = readfile(CFG.SpotsFile)
+        for line in text:gmatch("[^\r\n]+") do
+            -- tolerant parse: grab the 4 numbers on the line (slot, x, y, z)
+            local nums = {}
+            for tok in line:gmatch("[%-%+]?[%d]+%.?[%d]*") do nums[#nums + 1] = tonumber(tok) end
+            if #nums >= 4 and nums[1] and nums[2] and nums[3] and nums[4] then
+                loaded[#loaded + 1] = { slot = math.floor(nums[1]), pos = Vector3.new(nums[2], nums[3], nums[4]), placed = false }
+            end
+        end
+    end)
+    if not ok then
+        notify("Could not read saved spots: " .. tostring(err), "CTD Macro", 5)
+        return 0
+    end
+    spots = loaded
+    return #spots
+end
+
+local loadedCount = loadSpots()
+
+---------------------------------------------------------------- config file
+-- ctd_config.cfg stores your settings, tower counts and auto-start choice.
+-- ctd_spots.txt stores your recorded places. Both load automatically.
+local CONFIG_FILE = "ctd_config.cfg"
+
+local function saveConfig()
+    local lines = {}
+    for k, v in pairs(settings) do
+        lines[#lines + 1] = k .. "=" .. tostring(v)
+    end
+    for i = 1, 5 do
+        lines[#lines + 1] = "count" .. i .. "=" .. tostring(CFG.Counts[i] or 1)
+    end
+    local ok, err = pcall(writefile, CONFIG_FILE, table.concat(lines, "\n"))
+    if not ok then notify("Could not save config: " .. tostring(err), "CTD Macro", 5) end
+end
+
+local function loadConfig()
+    pcall(function()
+        if not isfile(CONFIG_FILE) then return end
+        for line in readfile(CONFIG_FILE):gmatch("[^\r\n]+") do
+            local k, v = line:match("^(%w+)=(.+)$")
+            if k then
+                local idx = k:match("^count(%d)$")
+                if idx then
+                    CFG.Counts[tonumber(idx)] = tonumber(v) or CFG.Counts[tonumber(idx)]
+                elseif settings[k] ~= nil then
+                    if type(settings[k]) == "boolean" then
+                        settings[k] = (v == "true")
+                    elseif type(settings[k]) == "string" then
+                        settings[k] = v
+                    else
+                        settings[k] = tonumber(v) or settings[k]
+                    end
+                end
+            end
+        end
+    end)
+end
+
+loadConfig()
+
+local function countBySlot(slot)
+    local n = 0
+    for _, s in ipairs(spots) do if s.slot == slot then n = n + 1 end end
+    return n
+end
+
+---------------------------------------------------------------- input helpers
+local function tap(key)
+    keypress(key)
+    wait(0.05)
+    keyrelease(key)
+end
+
+local function clickAt(x, y)
+    mousemoveabs(math.floor(x), math.floor(y))
+    wait(0.08)
+    mouse1click()
+end
+
+local function clickWorld(pos)
+    local sp, on = WorldToScreen(pos)
+    if not on then return false end
+    clickAt(sp.X, sp.Y)
+    return true
+end
+
+---------------------------------------------------------------- cash
+local function getCash()
+    local ok, val = pcall(function()
+        local ls = LocalPlayer:FindFirstChild("leaderstats")
+        local m = ls and ls:FindFirstChild("Money")
+        return m and m.Value
+    end)
+    if ok and type(val) == "number" then return val end
+    return nil
+end
+
+---------------------------------------------------------------- recording
+local function myRoot()
+    local c = LocalPlayer.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+-- towers can't share a spot: nudge a new position to the nearest free grid cell
+local function isFree(pos)
+    for _, s in ipairs(spots) do
+        local d = Vector3.new(s.pos.X - pos.X, 0, s.pos.Z - pos.Z).Magnitude
+        if d < settings.spacing * 0.9 then return false end
+    end
+    return true
+end
+
+local function findFree(pos)
+    if isFree(pos) then return pos end
+    local step = settings.spacing
+    for ring = 1, 8 do
+        for i = -ring, ring do
+            for j = -ring, ring do
+                if math.max(math.abs(i), math.abs(j)) == ring then
+                    local p = pos + Vector3.new(i * step, 0, j * step)
+                    if isFree(p) then return p end
+                end
+            end
+        end
+    end
+    return pos
+end
+
+local function recordGroup(slot)
+    local hrp = myRoot()
+    if not hrp then notify("No character found", "CTD Macro", 3) return end
+    local n = settings.groupMode and (CFG.Counts[slot] or 1) or 1
+    local base = hrp.Position -- exact coordinates of your character
+    local cols = math.ceil(math.sqrt(n))
+    local rows = math.ceil(n / cols)
+    for i = 0, n - 1 do
+        local c = i % cols
+        local r = math.floor(i / cols)
+        local dx = (c - (cols - 1) / 2) * settings.spacing
+        local dz = (r - (rows - 1) / 2) * settings.spacing
+        local want = base + Vector3.new(dx, 0, dz)
+        if settings.groupMode then
+            want = findFree(want)
+        elseif not isFree(want) then
+            notify("Warning: very close to another tower", "CTD Macro", 3)
+        end
+        spots[#spots + 1] = { slot = slot, pos = want, placed = false }
+    end
+    history[#history + 1] = n
+    saveSpots()
+    notify("Recorded " .. n .. "x slot " .. slot, "CTD Macro", 3)
+end
+
+local function undoGroup()
+    local n = table.remove(history)
+    if not n then
+        -- no history this session: remove one spot
+        n = math.min(1, #spots)
+    end
+    for _ = 1, n do table.remove(spots) end
+    saveSpots()
+    notify("Undid last record (" .. #spots .. " spots left)", "CTD Macro", 2)
+end
+
+local function clearAll()
+    spots, history = {}, {}
+    saveSpots()
+    notify("All spots cleared", "CTD Macro", 2)
+end
+
+---------------------------------------------------------------- game actions
+-- camera view: save where the camera is now, restore it later
+local camWarned = false
+
+local function saveCamera()
+    local saved = false
+    pcall(function()
+        local cam = workspace.CurrentCamera
+        local cf = cam.CFrame
+        local p, l = cf.Position, cf.LookVector
+        settings.camPX, settings.camPY, settings.camPZ = p.X, p.Y, p.Z
+        settings.camLX, settings.camLY, settings.camLZ = l.X, l.Y, l.Z
+        saved = true
+    end)
+    pcall(function() settings.camFov = workspace.CurrentCamera.FieldOfView end)
+    if saved then
+        settings.camSet = true
+        saveConfig()
+        notify("Camera view saved", "CTD Macro", 2)
+    else
+        notify("Couldn't read the camera in Matcha", "CTD Macro", 4)
+    end
+end
+
+local function applyCamera()
+    if not settings.camSet then return false end
+    local target = Vector3.new(settings.camPX, settings.camPY, settings.camPZ)
+    local look = Vector3.new(settings.camLX, settings.camLY, settings.camLZ)
+    pcall(function()
+        local cam = workspace.CurrentCamera
+        pcall(function() cam.CameraType = Enum.CameraType.Scriptable end)
+        cam.CFrame = CFrame.new(target, target + look)
+        if settings.camFov > 0 then cam.FieldOfView = settings.camFov end
+    end)
+    wait(0.1)
+    local good = false
+    pcall(function()
+        good = (workspace.CurrentCamera.CFrame.Position - target).Magnitude < 3
+    end)
+    if not good and not camWarned then
+        camWarned = true
+        notify("Camera didn't move - Matcha may not allow it, or the game controls the camera.", "CTD Macro", 6)
+    end
+    return good
+end
+
+-- fixed camera: while camLock is on, keep forcing the saved view many times a second
+task.spawn(function()
+    local wasLocked = false
+    while true do
+        if settings.camLock and settings.camSet then
+            pcall(function()
+                local cam = workspace.CurrentCamera
+                if not wasLocked then
+                    pcall(function() cam.CameraType = Enum.CameraType.Scriptable end)
+                    wasLocked = true
+                end
+                local p = Vector3.new(settings.camPX, settings.camPY, settings.camPZ)
+                local l = Vector3.new(settings.camLX, settings.camLY, settings.camLZ)
+                cam.CFrame = CFrame.new(p, p + l)
+                if settings.camFov > 0 then cam.FieldOfView = settings.camFov end
+            end)
+        elseif wasLocked then
+            wasLocked = false
+            pcall(function() workspace.CurrentCamera.CameraType = Enum.CameraType.Custom end)
+        end
+        wait(0.03)
+    end
+end)
+
+-- auto camera: works through plain mouse input, so it needs no camera write access.
+-- zooming fully out and tilting to the pitch limit gives the same view every time.
+local function offscreenCount()
+    local off = 0
+    for _, s in ipairs(spots) do
+        local _, on = WorldToScreen(s.pos - Vector3.new(0, settings.groundOffset, 0))
+        if not on then off = off + 1 end
+    end
+    return off
+end
+
+local function normalizeCamera(force)
+    if not force and not settings.camAuto then return end
+    local zdir = settings.zoomReverse and 1 or -1 -- wheel down = zoom out
+    for _ = 1, settings.zoomNotches do
+        mousescroll(zdir)
+        wait(0.03)
+    end
+    wait(0.2)
+    if settings.pitchDrag > 0 then
+        local pdir = settings.pitchReverse and -1 or 1 -- mouse down = look down
+        local steps = 10
+        local per = math.floor(settings.pitchDrag / steps)
+        mouse2press()
+        wait(0.1)
+        for _ = 1, steps do
+            mousemoverel(0, pdir * per)
+            wait(0.03)
+        end
+        wait(0.1)
+        mouse2release()
+    end
+    wait(0.3)
+    local off = offscreenCount()
+    if #spots > 0 and off > 0 then
+        notify(off .. " of " .. #spots .. " spots are off screen - zoom out more or move your spots closer", "CTD Macro", 6)
+    end
+end
+
+local tpWarned = false
+local function teleportHome()
+    if not settings.tpSet then return false end
+    local hrp = myRoot()
+    if not hrp then return false end
+    local target = Vector3.new(settings.tpX, settings.tpY, settings.tpZ)
+    pcall(function() hrp.CFrame = CFrame.new(target.X, target.Y, target.Z) end)
+    wait(0.3)
+    local now = myRoot()
+    local moved = now and (now.Position - target).Magnitude < 8
+    if not moved and not tpWarned then
+        tpWarned = true
+        notify("Teleport didn't move you - Matcha may not allow it. Walk to your spot manually.", "CTD Macro", 6)
+    end
+    return moved and true or false
+end
+
+local function placeSpot(s)
+    if settings.camEnabled then applyCamera() end
+    local key = CFG.SlotKeys[s.slot]
+    if not key then return end
+    tap(key)
+    wait(0.2)
+    if clickWorld(s.pos - Vector3.new(0, settings.groundOffset, 0)) then
+        s.placed = true
+        wait(0.3)
+        if CFG.CancelKey then tap(CFG.CancelKey) end
+    end
+end
+
+local function upgradeSpot(s, times)
+    if clickWorld(s.pos) then
+        wait(0.15)
+        for _ = 1, times do
+            tap(CFG.UpgradeKey)
+            wait(0.12)
+        end
+    end
+end
+
+local function findReplayButton()
+    local gui = LocalPlayer:FindFirstChild("PlayerGui")
+    if not gui then return nil end
+    for _, d in ipairs(gui:GetDescendants()) do
+        local ok, hit = pcall(function()
+            if not d:IsA("GuiObject") or not d.Visible then return false end
+            local t = string.lower(d.Text or "")
+            for _, w in ipairs(CFG.ReplayWords) do
+                if t:find(w, 1, true) then return true end
+            end
+            return false
+        end)
+        if ok and hit then return d end
+    end
+    return nil
+end
+
+---------------------------------------------------------------- main loop
+-- find a visible GUI element whose (lowercased) text satisfies matchFn
+local function isShown(d)
+    local node = d
+    for _ = 1, 12 do
+        if not node then break end
+        local ok, hidden = pcall(function()
+            if node:IsA("GuiObject") then return not node.Visible end
+            return node.Enabled == false
+        end)
+        if ok and hidden then return false end
+        node = node.Parent
+    end
+    return true
+end
+
+local function findGuiText(matchFn)
+    local gui = LocalPlayer:FindFirstChild("PlayerGui")
+    if not gui then return nil end
+    for _, d in ipairs(gui:GetDescendants()) do
+        local ok, hit = pcall(function()
+            if not d:IsA("GuiObject") then return false end
+            local t = d.Text
+            if not t or t == "" then return false end
+            return matchFn(string.lower(t)) and isShown(d)
+        end)
+        if ok and hit then return d end
+    end
+    return nil
+end
+
+local function clickGui(d)
+    local p, s = d.AbsolutePosition, d.AbsoluteSize
+    clickAt(p.X + s.X / 2, p.Y + s.Y / 2 + settings.insetY)
+end
+
+local lastSkip, lastSpeed, speedTries = 0, 0, 0
+local speedDone, speedRemoteTried, speedWarned = false, 0, false
+
+-- game.ReplicatedStorage.ModuleLoader.Shared.Network.RemoteEvent.ModeVote:FireServer(<mode>)
+local modeWarned = false
+
+local function parseVoteArg(s)
+    if s == "true" then return true end
+    if s == "false" then return false end
+    return tonumber(s) or s
+end
+
+local function fireModeVote(force)
+    if not force and not settings.modeVoteEnabled then return false end
+    local ok, err = pcall(function()
+        local node = game:GetService("ReplicatedStorage")
+        for _, name in ipairs({ "ModuleLoader", "Shared", "Network", "RemoteEvent", "ModeVote" }) do
+            node = node:FindFirstChild(name)
+            if not node then error("missing " .. name) end
+        end
+        if settings.modeVoteArg == "" then
+            node:FireServer()
+        else
+            node:FireServer(parseVoteArg(settings.modeVoteArg))
+        end
+    end)
+    if not ok and not modeWarned then
+        modeWarned = true
+        notify("ModeVote remote failed: " .. tostring(err), "CTD Macro", 6)
+    end
+    return ok
+end
+
+-- the vote itself is sent by the main loop, modeVoteAfter seconds after the server/round starts
+local function voteMode()
+    voteDone = false
+end
+
+-- game.ReplicatedStorage.ModuleLoader.Shared.Network.RemoteEvent.PlayAgain:FireServer()
+local playWarned = false
+local function firePlayAgain()
+    local ok, err = pcall(function()
+        local node = game:GetService("ReplicatedStorage")
+        for _, name in ipairs({ "ModuleLoader", "Shared", "Network", "RemoteEvent", "PlayAgain" }) do
+            node = node:FindFirstChild(name)
+            if not node then error("missing " .. name) end
+        end
+        node:FireServer()
+    end)
+    if not ok and not playWarned then
+        playWarned = true
+        notify("PlayAgain remote failed (" .. tostring(err) .. "), clicking the button instead", "CTD Macro", 6)
+    end
+    return ok
+end
+
+-- game.Players.<you>.PlayerGui.GameUI.Stats.WaveSkipGui (the skip wave button)
+local function getWaveSkipButton()
+    local node
+    local ok = pcall(function()
+        node = LocalPlayer:FindFirstChild("PlayerGui")
+        for _, name in ipairs({ "GameUI", "Stats", "WaveSkipGui" }) do
+            node = node and node:FindFirstChild(name)
+        end
+    end)
+    if ok and node and isShown(node) then return node end
+    return nil
+end
+
+-- game.ReplicatedStorage.ModuleLoader.Shared.Network.RemoteFunction.ChangeSpeed:InvokeServer(1.5)
+local SPEED_REMOTE_PATH = { "ModuleLoader", "Shared", "Network", "RemoteFunction", "ChangeSpeed" }
+
+local function setSpeedRemote()
+    local ok, err = pcall(function()
+        local node = game:GetService("ReplicatedStorage")
+        for _, name in ipairs(SPEED_REMOTE_PATH) do
+            node = node:FindFirstChild(name)
+            if not node then error("missing " .. name) end
+        end
+        node:InvokeServer(settings.gameSpeed)
+    end)
+    if not ok and not speedWarned and speedRemoteTried >= 3 then
+        speedWarned = true
+        notify("Speed remote failed (" .. tostring(err) .. "), falling back to button click", "CTD Macro", 6)
+    end
+    return ok
+end
+
+local function autoUtilities()
+    -- 1.5x speed: find the speed button (text like "1x", "1.5x", "2x") and click until it reads 1.5x
+    if settings.autoSpeed and not speedDone and speedRemoteTried < 3 then
+        speedRemoteTried = speedRemoteTried + 1
+        if setSpeedRemote() then
+            speedDone = true
+            status = "Speed set to " .. tostring(settings.gameSpeed) .. "x"
+        else
+            wait(1)
+        end
+    end
+    -- fallback: click a speed button in the GUI if the remote didn't work
+    if settings.autoSpeed and not speedDone and speedRemoteTried >= 3 and tick() - lastSpeed >= 3 then
+        lastSpeed = tick()
+        local b = findGuiText(function(t)
+            return t:match("^%s*%d+%.?%d*%s*x%s*$") or t:match("^%s*x%s*%d+%.?%d*%s*$")
+        end)
+        if b then
+            local t = string.lower(b.Text)
+            if t:find("1.5", 1, true) then
+                speedTries = 0
+            elseif speedTries < 3 then
+                status = "Setting 1.5x speed"
+                clickGui(b)
+                speedTries = speedTries + 1
+                wait(0.3)
+            end
+        end
+    end
+    -- skip wave
+    if settings.autoSkip and tick() - lastSkip >= settings.skipEvery then
+        lastSkip = tick()
+        local b = getWaveSkipButton() or findGuiText(function(t) return t:find("skip", 1, true) ~= nil end)
+        if b then
+            status = "Skipping wave"
+            clickGui(b)
+            wait(0.2)
+        end
+    end
+end
+
+---------------------------------------------------------------- round start clicks
+-- things to click when the macro starts and after each Replay (e.g. a "Start" / "Ready" button).
+-- text targets find a visible button by its text; position targets click a screen pixel.
+local clickTargets = {}
+local CLICKS_FILE = "ctd_clicks.txt"
+local pendingClickDel = nil
+local newClickText = ""
+
+local function saveClicks()
+    local lines = {}
+    for _, c in ipairs(clickTargets) do
+        if c.kind == "text" then
+            lines[#lines + 1] = "text|" .. c.text
+        else
+            lines[#lines + 1] = string.format("pos|%d|%d", c.x, c.y)
+        end
+    end
+    local ok, err = pcall(writefile, CLICKS_FILE, table.concat(lines, "\n"))
+    if not ok then notify("Could not save click targets: " .. tostring(err), "CTD Macro", 5) end
+end
+
+local function loadClicks()
+    clickTargets = {}
+    pcall(function()
+        if not isfile(CLICKS_FILE) then return end
+        for line in readfile(CLICKS_FILE):gmatch("[^\r\n]+") do
+            local txt = line:match("^text|(.+)$")
+            local px, py = line:match("^pos|([%-%d%.]+)|([%-%d%.]+)$")
+            if txt then
+                clickTargets[#clickTargets + 1] = { kind = "text", text = txt }
+            elseif px and py then
+                clickTargets[#clickTargets + 1] = { kind = "pos", x = tonumber(px), y = tonumber(py) }
+            end
+        end
+    end)
+end
+
+loadClicks()
+
+local function runRoundStartClicks(force)
+    for _, c in ipairs(clickTargets) do
+        if not force and not running then return end
+        if c.kind == "pos" then
+            clickAt(c.x, c.y)
+        else
+            local needle = string.lower(c.text)
+            local b
+            for _ = 1, 10 do -- wait up to ~5s for the button to appear
+                b = findGuiText(function(t) return t:find(needle, 1, true) ~= nil end)
+                if b or (not force and not running) then break end
+                wait(0.5)
+            end
+            if b then clickGui(b) end
+        end
+        wait(0.5)
+    end
+end
+
+local function captureMouse()
+    notify("Move your mouse over the target - capturing in 3s", "CTD Macro", 3)
+    wait(3)
+    local ok, pos = pcall(function() return game:GetService("UserInputService"):GetMouseLocation() end)
+    if ok and pos then
+        clickTargets[#clickTargets + 1] = { kind = "pos", x = pos.X, y = pos.Y }
+        saveClicks()
+        notify(string.format("Saved click position (%d, %d)", pos.X, pos.Y), "CTD Macro", 3)
+    else
+        notify("Matcha can't read the mouse position - add a text target instead", "CTD Macro", 5)
+    end
+end
+
+local function mainLoop()
+    local lastUpgrade = 0
+    local myGen = runGen
+    if settings.tpEnabled then teleportHome() wait(1) end
+    if settings.camEnabled then applyCamera() end
+    normalizeCamera()
+    voteMode()
+    runRoundStartClicks()
+    while running and myGen == runGen do
+        -- timers that only use remotes, so they work even if the Roblox window isn't focused
+        if settings.modeVoteEnabled and not voteDone and tick() - roundStart >= settings.modeVoteAfter then
+            voteDone = true
+            fireModeVote()
+        end
+        if settings.timedPlayAgain and tick() - roundStart >= settings.playAgainAfter then
+            status = "Timed PlayAgain"
+            firePlayAgain()
+            roundStart = tick()
+            voteDone = false
+            speedDone, speedRemoteTried, speedTries = false, 0, 0
+            for _, sp in ipairs(spots) do sp.placed = false end
+        end
+        if isrbxactive() then
+            local btn = findReplayButton()
+            if btn then
+                status = "Replaying..."
+                if not (settings.useReplayRemote and firePlayAgain()) then
+                    local p, s = btn.AbsolutePosition, btn.AbsoluteSize
+                    clickAt(p.X + s.X / 2, p.Y + s.Y / 2 + settings.insetY)
+                end
+                for _, sp in ipairs(spots) do sp.placed = false end
+                speedTries = 0 -- speed may reset each round
+                speedDone, speedRemoteTried = false, 0
+                roundStart = tick()
+                voteDone = false
+                wait(settings.roundDelay)
+                if settings.tpEnabled then teleportHome() wait(1) end
+                if settings.camEnabled then applyCamera() end
+                normalizeCamera()
+                voteMode()
+                runRoundStartClicks()
+            else
+                autoUtilities()
+                local didSomething = false
+                -- starter slot first, then the rest in recorded order
+                for pass = 1, 2 do
+                    for _, sp in ipairs(spots) do
+                        if not running then break end
+                        local isStarter = (sp.slot == CFG.StarterSlot)
+                        if not sp.placed and ((pass == 1) == isStarter) then
+                            local cost = CFG.Costs[sp.slot]
+                            local cash = getCash()
+                            if cash and cost and cash < cost then
+                                status = "Waiting for cash ($" .. cost .. ")"
+                                wait(1)
+                            else
+                                status = "Placing slot " .. sp.slot
+                                placeSpot(sp)
+                                wait(settings.placeDelay)
+                            end
+                            didSomething = true
+                            break
+                        end
+                    end
+                    if didSomething then break end
+                end
+                if not didSomething and tick() - lastUpgrade >= settings.upgradeEvery then
+                    status = "Upgrading"
+                    for _, sp in ipairs(spots) do
+                        if not running then break end
+                        if sp.placed then upgradeSpot(sp, settings.upgradesPerPass) end
+                    end
+                    lastUpgrade = tick()
+                elseif not didSomething then
+                    status = "Running"
+                end
+            end
+        end
+        wait(0.5)
+    end
+    status = "Stopped"
+end
+
+local function setRunning(v)
+    if v and not running then
+        if #spots == 0 then notify("Create places first (Slot buttons)", "CTD Macro", 3) return end
+        runGen = runGen + 1
+        running = true
+        notify("Macro started", "CTD Macro", 2)
+        task.spawn(mainLoop)
+    elseif not v and running then
+        running = false
+        notify("Macro stopped", "CTD Macro", 2)
+    end
+end
+
+---------------------------------------------------------------- hotkeys
+task.spawn(function()
+    local down = {}
+    local function pressed(vk)
+        local p = iskeypressed(vk)
+        local fresh = p and not down[vk]
+        down[vk] = p
+        return fresh
+    end
+    while true do
+        if isrbxactive() then
+            if pressed(0x77) then setRunning(not running) end       -- F8 start/stop
+        end
+        wait(0.05)
+    end
+end)
+
+---------------------------------------------------------------- new server refresh
+-- when the server changes (game.JobId differs), reload everything and restart the macro.
+-- if Matcha clears the script on teleport, put the script in Matcha's autoexec so it
+-- loads again, and turn on Auto-start.
+local function currentJobId()
+    local ok, id = pcall(function() return game.JobId end)
+    if ok and type(id) == "string" and id ~= "" then return id end
+    return nil
+end
+
+local lastJob = currentJobId()
+
+local function onNewServer()
+    local wasRunning = running
+    running = false
+    status = "New server - refreshing"
+    notify("New server detected - refreshing script", "CTD Macro", 4)
+    wait(2)
+    pcall(function() LocalPlayer = Players.LocalPlayer end)
+    loadConfig()
+    loadSpots()
+    loadClicks()
+    history = {}
+    for _, sp in ipairs(spots) do sp.placed = false end
+    speedDone, speedRemoteTried, speedTries, speedWarned = false, 0, 0, false
+    voteDone = false
+    roundStart = tick() -- the vote and PlayAgain timers count from here
+    if wasRunning or settings.autostart then
+        wait(3)
+        setRunning(true)
+    end
+end
+
+task.spawn(function()
+    while true do
+        wait(1)
+        local id = currentJobId()
+        if id then
+            if lastJob and id ~= lastJob then
+                lastJob = id
+                onNewServer()
+            else
+                lastJob = id
+            end
+        end
+    end
+end)
+
+---------------------------------------------------------------- menu
+-- edits to individual places are queued and applied at the start of the next frame
+local pending = nil
+
+local function applyPending()
+    if not pending then return end
+    local kind, i = pending[1], pending[2]
+    pending = nil
+    if not spots[i] then return end
+    if kind == "delete" then
+        table.remove(spots, i)
+    elseif kind == "move" then
+        local hrp = myRoot()
+        if not hrp then notify("No character found", "CTD Macro", 3) return end
+        spots[i].pos = hrp.Position
+        notify("Moved #" .. i .. " to where you stand", "CTD Macro", 2)
+    elseif kind == "up" and i > 1 then
+        spots[i], spots[i - 1] = spots[i - 1], spots[i]
+    end
+    history = {}
+    saveSpots()
+end
+
+UI.AddTab("CTD Macro", function(tab)
+    applyPending()
+    if pendingClickDel then
+        table.remove(clickTargets, pendingClickDel)
+        pendingClickDel = nil
+        saveClicks()
+    end
+    local main = tab:Section("Macro", "Left")
+    main:Button(running and "Stop (F8)" or "Start (F8)", function() setRunning(not running) end)
+    main:Text("Status: " .. status)
+    main:Text(string.format("Spots recorded: %d  (slot5: %d, slot1: %d)", #spots, countBySlot(5), countBySlot(1)))
+    main:Spacing()
+    main:Button("Undo last", undoGroup)
+    main:Button("Clear all spots", clearAll)
+    main:Button("Reload saved spots", function()
+        local n = loadSpots()
+        history = {}
+        notify("Loaded " .. n .. " saved spots", "CTD Macro", 3)
+    end)
+
+    local rec = tab:Section("Create place here", "Left")
+    rec:Toggle("ctd_group", "Group mode (auto-grid)", settings.groupMode, function(v)
+        settings.groupMode = v
+        saveConfig()
+    end)
+    rec:Text(settings.groupMode and "Group mode: each click makes several towers in a grid." or "Stand exactly where you want ONE tower, then click:")
+    for i = 1, 5 do
+        local label = settings.groupMode
+            and string.format("Slot %d (x%d) - create place here", i, CFG.Counts[i] or 1)
+            or string.format("Slot %d - create place here", i)
+        rec:Button(label, function() recordGroup(i) end)
+    end
+
+    local list = tab:Section("Your places", "Left")
+    list:Text("Placed in this order (slot 5 first).")
+    if #spots == 0 then list:Text("None yet.") end
+    for i, s in ipairs(spots) do
+        list:Text(string.format("#%d  Slot %d  (%.1f, %.1f, %.1f)", i, s.slot, s.pos.X, s.pos.Y, s.pos.Z))
+        list:Button("Move #" .. i .. " here", function() pending = { "move", i } end)
+        list:Button("Up #" .. i, function() pending = { "up", i } end)
+        list:Button("Delete #" .. i, function() pending = { "delete", i } end)
+    end
+
+    local cnt = tab:Section("Towers per click (group mode)", "Right")
+    for i = 1, 5 do
+        cnt:SliderInt("ctd_count_" .. i, "Slot " .. i, 1, 12, CFG.Counts[i] or 1, function(v) CFG.Counts[i] = v saveConfig() end)
+    end
+
+    local mv = tab:Section("Mode vote", "Right")
+    mv:Toggle("ctd_mode_vote", "Auto pick mode (ModeVote remote)", settings.modeVoteEnabled, function(v)
+        settings.modeVoteEnabled = v
+        saveConfig()
+    end)
+    mv:InputText("ctd_mode_arg", "Mode value to send", settings.modeVoteArg, function(v)
+        if v ~= settings.modeVoteArg then
+            settings.modeVoteArg = v
+            saveConfig()
+        end
+    end)
+    mv:SliderInt("ctd_mode_after", "Vote this many s after joining", 0, 60, settings.modeVoteAfter, function(v) settings.modeVoteAfter = v saveConfig() end)
+    mv:Button("Test vote now", function() task.spawn(function() fireModeVote(true) end) end)
+
+    local cm = tab:Section("Camera", "Right")
+    cm:Text(settings.camSet and "Camera view saved" or "No camera view saved")
+    cm:Button("Save current camera view", saveCamera)
+    cm:Button("Apply camera now", function() task.spawn(applyCamera) end)
+    cm:Toggle("ctd_cam_lock", "Lock camera (fixed view)", settings.camLock, function(v)
+        settings.camLock = v
+        saveConfig()
+    end)
+    cm:Text("Turn lock off to move the camera, then re-save the view.")
+    cm:Text("If Matcha can't set the camera, use auto camera:")
+    cm:Toggle("ctd_cam_auto", "Auto camera (zoom out + look down)", settings.camAuto, function(v)
+        settings.camAuto = v
+        saveConfig()
+    end)
+    cm:SliderInt("ctd_zoom", "Zoom-out scroll notches", 0, 40, settings.zoomNotches, function(v) settings.zoomNotches = v saveConfig() end)
+    cm:SliderInt("ctd_pitch", "Look-down drag (px)", 0, 1500, settings.pitchDrag, function(v) settings.pitchDrag = v saveConfig() end)
+    cm:Toggle("ctd_zoom_rev", "Reverse zoom direction", settings.zoomReverse, function(v)
+        settings.zoomReverse = v
+        saveConfig()
+    end)
+    cm:Toggle("ctd_pitch_rev", "Reverse look-down direction", settings.pitchReverse, function(v)
+        settings.pitchReverse = v
+        saveConfig()
+    end)
+    cm:Button("Test auto camera now", function() task.spawn(function() normalizeCamera(true) end) end)
+    cm:Toggle("ctd_cam_enabled", "Set camera at start / before placing", settings.camEnabled, function(v)
+        settings.camEnabled = v
+        saveConfig()
+    end)
+
+    local rc = tab:Section("Round start clicks", "Right")
+    rc:Text("Clicked when the macro starts and after each Replay.")
+    rc:InputText("ctd_click_text", "Button text to click", "", function(v) newClickText = v end)
+    rc:Button("Add text target", function()
+        if newClickText ~= "" then
+            clickTargets[#clickTargets + 1] = { kind = "text", text = newClickText }
+            saveClicks()
+            notify("Added click target: " .. newClickText, "CTD Macro", 2)
+        end
+    end)
+    rc:Button("Add mouse position (3s countdown)", function() task.spawn(captureMouse) end)
+    for i, c in ipairs(clickTargets) do
+        rc:Text(c.kind == "text"
+            and string.format('#%d text: "%s"', i, c.text)
+            or string.format("#%d position (%d, %d)", i, c.x, c.y))
+        rc:Button("Delete click #" .. i, function() pendingClickDel = i end)
+    end
+    rc:Button("Test clicks now", function() task.spawn(function() runRoundStartClicks(true) end) end)
+
+    local tp = tab:Section("Teleport spot", "Right")
+    tp:Text(settings.tpSet
+        and string.format("Saved: (%.1f, %.1f, %.1f)", settings.tpX, settings.tpY, settings.tpZ)
+        or "No teleport spot set")
+    tp:Button("Set teleport spot here", function()
+        local hrp = myRoot()
+        if not hrp then notify("No character found", "CTD Macro", 3) return end
+        settings.tpX, settings.tpY, settings.tpZ = hrp.Position.X, hrp.Position.Y, hrp.Position.Z
+        settings.tpSet = true
+        saveConfig()
+        notify("Teleport spot saved", "CTD Macro", 2)
+    end)
+    tp:Button("Teleport now", function() task.spawn(teleportHome) end)
+    tp:Toggle("ctd_tp_enabled", "Teleport there at round start", settings.tpEnabled, function(v)
+        settings.tpEnabled = v
+        saveConfig()
+    end)
+
+    local opt = tab:Section("Settings", "Right")
+    opt:Toggle("ctd_autostart", "Auto-start when script loads", settings.autostart, function(v)
+        settings.autostart = v
+        saveConfig()
+    end)
+    opt:Toggle("ctd_autoskip", "Auto skip wave", settings.autoSkip, function(v)
+        settings.autoSkip = v
+        saveConfig()
+    end)
+    opt:Toggle("ctd_autospeed", "Auto 1.5x speed", settings.autoSpeed, function(v)
+        settings.autoSpeed = v
+        saveConfig()
+    end)
+    opt:Toggle("ctd_timed_play", "Timed PlayAgain", settings.timedPlayAgain, function(v)
+        settings.timedPlayAgain = v
+        saveConfig()
+    end)
+    opt:SliderInt("ctd_play_after", "PlayAgain after (s)  386 = 6:26", 30, 900, settings.playAgainAfter, function(v) settings.playAgainAfter = v saveConfig() end)
+    opt:Toggle("ctd_replay_remote", "Replay via PlayAgain remote", settings.useReplayRemote, function(v)
+        settings.useReplayRemote = v
+        saveConfig()
+    end)
+    opt:SliderFloat("ctd_game_speed", "Game speed", 1.0, 3.0, settings.gameSpeed, "%.1f", function(v) settings.gameSpeed = v saveConfig() end)
+    opt:SliderInt("ctd_skip_every", "Skip check every (s)", 1, 10, settings.skipEvery, function(v) settings.skipEvery = v saveConfig() end)
+    opt:SliderInt("ctd_spacing", "Tower spacing (studs)", 2, 12, settings.spacing, function(v) settings.spacing = v saveConfig() end)
+    opt:SliderInt("ctd_ground", "Click depth below character (studs)", 0, 6, settings.groundOffset, function(v) settings.groundOffset = v saveConfig() end)
+    opt:SliderInt("ctd_place_delay", "Delay after placing (s)", 0, 10, settings.placeDelay, function(v) settings.placeDelay = v saveConfig() end)
+    opt:SliderInt("ctd_upg_every", "Upgrade every (s)", 1, 30, settings.upgradeEvery, function(v) settings.upgradeEvery = v saveConfig() end)
+    opt:SliderInt("ctd_upg_n", "Upgrades per pass", 1, 5, settings.upgradesPerPass, function(v) settings.upgradesPerPass = v saveConfig() end)
+    opt:SliderInt("ctd_round_delay", "Wait after replay (s)", 1, 20, settings.roundDelay, function(v) settings.roundDelay = v saveConfig() end)
+    opt:SliderInt("ctd_inset", "Replay click offset Y (px)", 0, 80, settings.insetY, function(v) settings.insetY = v saveConfig() end)
+end)
+
+notify("Loaded " .. tostring(loadedCount) .. " saved spots. Open the CTD Macro tab to start.", "CTD Macro", 5)
+
+-- keep using it: resume automatically if auto-start is on
+if settings.autostart and #spots > 0 then
+    task.spawn(function()
+        wait(3)
+        setRunning(true)
+    end)
+end
