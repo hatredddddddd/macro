@@ -31,6 +31,8 @@ local settings = {
     roundDelay = 6,       -- seconds to wait after clicking replay
     insetY = 58,          -- GUI inset for the replay click
     autostart = false,    -- start the macro automatically when the script loads
+    afkMode = false,      -- master switch: turns on everything needed to farm unattended
+    useRemotes = true,    -- allow the ChangeSpeed / PlayAgain remotes (turn off to use button clicks only)
     groupMode = false,    -- false: one tower exactly where you stand; true: auto-grid groups
     groundOffset = 3,     -- studs below your character's center where the placement click lands
     tpSet = false,        -- a teleport spot has been saved
@@ -38,11 +40,15 @@ local settings = {
     tpEnabled = false,    -- teleport to the spot at the start of each round
     autoSkip = false,     -- click the "skip wave" button when it shows
     useReplayRemote = true, -- fire the PlayAgain remote instead of clicking the Replay button
-    modeVoteEnabled = false, -- vote for a mode with the ModeVote remote at round start
-    modeVoteArg = "",     -- value passed to ModeVote:FireServer (text, number, true/false); empty = no argument
+    modeVoteEnabled = false, -- vote for a mode by clicking its Vote button at round start
+    modeVoteMode = 3,     -- 1 Easy, 2 Normal, 3 Hard, 4 Insane, 5 Nightmare
+    modeVoteOffX = 400,   -- pixel nudge added to the calculated click position
+    modeVoteOffY = 0,
+    modeVoteClicks = 1,   -- how many times to click the Vote button
     modeVoteAfter = 8,    -- seconds after joining the server / starting a round before voting
     timedPlayAgain = true, -- fire PlayAgain on a timer instead of waiting for the Replay button
     playAgainAfter = 386, -- seconds after the round starts (386 = 6:26)
+    unloadOnNewServer = false, -- unload completely on a new server so autoexec can run a fresh copy
     autoSpeed = false,    -- set game speed (default 1.5x) through the ChangeSpeed remote
     gameSpeed = 1.5,      -- speed value sent to the remote
     skipEvery = 2,        -- seconds between skip checks
@@ -57,6 +63,7 @@ local settings = {
     pitchDrag = 600,      -- pixels of right-mouse drag used to tilt the camera down
     zoomReverse = false,  -- flip scroll direction if the camera zooms in instead
     pitchReverse = false, -- flip drag direction if the camera looks up instead
+    pitchAbs = false,     -- drag with absolute mouse moves instead of relative ones
 }
 
 local spots = {}    -- { slot, pos, placed }
@@ -66,6 +73,28 @@ local status = "Idle"
 local roundStart = tick()  -- when this server/round began (script load, new server, or replay)
 local voteDone = false     -- mode vote already sent for this round
 local runGen = 0           -- bumps on every start so an old loop can't keep running
+
+-- instance guard: a copy of the script stops its own loops when a newer copy has loaded.
+-- this only compares a number, it never calls anything left over from an old copy,
+-- so restarting the LuaVM can't run stale code.
+local alive = true
+_G.__CTD_INSTANCE = (tonumber(_G.__CTD_INSTANCE) or 0) + 1
+local instanceId = _G.__CTD_INSTANCE
+local function isAlive()
+    return alive and _G.__CTD_INSTANCE == instanceId
+end
+
+local wantRunning = false  -- the user wants the macro on (so it can be restarted if it stalls)
+local lastBeat = tick()    -- last time the main loop proved it is alive
+
+local function unload()
+    alive = false
+    wantRunning = false
+    running = false
+    runGen = runGen + 1
+    status = "Unloaded"
+    pcall(notify, "CTD Macro unloaded", "CTD Macro", 3)
+end
 
 ---------------------------------------------------------------- persistence
 local function saveSpots()
@@ -139,6 +168,7 @@ local function loadConfig()
             end
         end
     end)
+    settings.camLock = false -- the constant 30x/second camera lock stays removed
 end
 
 loadConfig()
@@ -184,6 +214,17 @@ end
 local function myRoot()
     local c = LocalPlayer.Character
     return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+-- after joining a server, wait until the character has loaded before starting anything
+local function waitForCharacter(timeout)
+    local t0 = tick()
+    while tick() - t0 < timeout do
+        local ok, root = pcall(myRoot)
+        if ok and root then return true end
+        wait(0.5)
+    end
+    return false
 end
 
 -- towers can't share a spot: nudge a new position to the nearest free grid cell
@@ -277,32 +318,55 @@ local function saveCamera()
     end
 end
 
-local function applyCamera()
+-- Sets the saved camera view. You found that it only works after you nudge the camera a
+-- little by hand, so with full=true this does that nudge itself (a tiny right-click drag)
+-- and retries a few times. The camera object is fetched fresh on every attempt, in case the
+-- old reference went stale after spawning or a server change.
+-- This is a one-off write per round, not a constant lock.
+local function applyCamera(full)
     if not settings.camSet then return false end
     local target = Vector3.new(settings.camPX, settings.camPY, settings.camPZ)
     local look = Vector3.new(settings.camLX, settings.camLY, settings.camLZ)
-    pcall(function()
-        local cam = workspace.CurrentCamera
-        pcall(function() cam.CameraType = Enum.CameraType.Scriptable end)
-        cam.CFrame = CFrame.new(target, target + look)
-        if settings.camFov > 0 then cam.FieldOfView = settings.camFov end
-    end)
-    wait(0.1)
-    local good = false
-    pcall(function()
-        good = (workspace.CurrentCamera.CFrame.Position - target).Magnitude < 3
-    end)
-    if not good and not camWarned then
-        camWarned = true
-        notify("Camera didn't move - Matcha may not allow it, or the game controls the camera.", "CTD Macro", 6)
+    local attempts = full and 5 or 1
+    for _ = 1, attempts do
+        if full then
+            pcall(function()
+                pcall(setrobloxinput, true)
+                mouse2press()
+                wait(0.15)
+                mousemoverel(0, 3)
+                wait(0.05)
+                mousemoverel(0, -3)
+                wait(0.1)
+                mouse2release()
+            end)
+            wait(0.3)
+        end
+        pcall(function()
+            local cam = game:GetService("Workspace").CurrentCamera
+            pcall(function() cam.CameraType = Enum.CameraType.Scriptable end)
+            cam.CFrame = CFrame.new(target, target + look)
+            if settings.camFov > 0 then cam.FieldOfView = settings.camFov end
+        end)
+        wait(0.2)
+        local good = false
+        pcall(function()
+            local p = game:GetService("Workspace").CurrentCamera.CFrame.Position
+            good = (p - target).Magnitude < 3
+        end)
+        if good then return true end
     end
-    return good
+    if not camWarned then
+        camWarned = true
+        notify("Camera still didn't move after retrying - the game may be controlling it.", "CTD Macro", 6)
+    end
+    return false
 end
 
 -- fixed camera: while camLock is on, keep forcing the saved view many times a second
 task.spawn(function()
     local wasLocked = false
-    while true do
+    while false do -- camera lock removed: writing the camera 30x a second can crash Roblox
         if settings.camLock and settings.camSet then
             pcall(function()
                 local cam = workspace.CurrentCamera
@@ -321,6 +385,7 @@ task.spawn(function()
         end
         wait(0.03)
     end
+    if wasLocked then pcall(function() workspace.CurrentCamera.CameraType = Enum.CameraType.Custom end) end
 end)
 
 -- auto camera: works through plain mouse input, so it needs no camera write access.
@@ -336,6 +401,8 @@ end
 
 local function normalizeCamera(force)
     if not force and not settings.camAuto then return end
+    -- a saved camera view takes priority over the zoom-out / look-down reset
+    if not force and settings.camEnabled and settings.camSet then return end
     local zdir = settings.zoomReverse and 1 or -1 -- wheel down = zoom out
     for _ = 1, settings.zoomNotches do
         mousescroll(zdir)
@@ -344,16 +411,39 @@ local function normalizeCamera(force)
     wait(0.2)
     if settings.pitchDrag > 0 then
         local pdir = settings.pitchReverse and -1 or 1 -- mouse down = look down
-        local steps = 10
-        local per = math.floor(settings.pitchDrag / steps)
+        -- make sure injected mouse input is allowed to reach the game
+        pcall(setrobloxinput, true)
+        -- start from the middle of the window so the drag isn't over a button or menu
+        local vw, vh = 1920, 1080
+        pcall(function()
+            local vs = workspace.CurrentCamera.ViewportSize
+            if vs.X > 0 and vs.Y > 0 then vw, vh = vs.X, vs.Y end
+        end)
+        local cx, cy = math.floor(vw / 2), math.floor(vh / 2)
+        mousemoveabs(cx, cy)
+        wait(0.2)
         mouse2press()
-        wait(0.1)
-        for _ = 1, steps do
-            mousemoverel(0, pdir * per)
-            wait(0.03)
+        wait(0.3) -- let Roblox lock the cursor and start a camera drag
+        -- many small moves: Roblox turns each frame's movement into rotation, so one big jump is ignored
+        local step = 8
+        local steps = math.max(1, math.floor(settings.pitchDrag / step))
+        if settings.pitchAbs then
+            for i = 1, steps do
+                mousemoveabs(cx, cy + pdir * i * step)
+                wait(0.02)
+            end
+        else
+            mousemoverel(0, pdir) -- tiny first nudge to start the drag
+            wait(0.05)
+            for _ = 1, steps do
+                mousemoverel(0, pdir * step)
+                wait(0.02)
+            end
         end
-        wait(0.1)
+        wait(0.2)
         mouse2release()
+        wait(0.1)
+        mousemoveabs(cx, cy)
     end
     wait(0.3)
     local off = offscreenCount()
@@ -402,22 +492,7 @@ local function upgradeSpot(s, times)
     end
 end
 
-local function findReplayButton()
-    local gui = LocalPlayer:FindFirstChild("PlayerGui")
-    if not gui then return nil end
-    for _, d in ipairs(gui:GetDescendants()) do
-        local ok, hit = pcall(function()
-            if not d:IsA("GuiObject") or not d.Visible then return false end
-            local t = string.lower(d.Text or "")
-            for _, w in ipairs(CFG.ReplayWords) do
-                if t:find(w, 1, true) then return true end
-            end
-            return false
-        end)
-        if ok and hit then return d end
-    end
-    return nil
-end
+-- (findReplayButton is defined further down, next to the shared GUI snapshot)
 
 ---------------------------------------------------------------- main loop
 -- find a visible GUI element whose (lowercased) text satisfies matchFn
@@ -435,19 +510,53 @@ local function isShown(d)
     return true
 end
 
-local function findGuiText(matchFn)
+-- Walking the whole GUI tree is the heaviest thing this script does, and it reads Roblox's
+-- memory from outside. So it is done at most once every few seconds and shared by every
+-- feature (replay, skip, speed, vote, round start clicks) instead of once per feature per loop.
+local SNAPSHOT_EVERY = 4
+local guiSnap, guiSnapAt = {}, 0
+
+local function snapshotGui()
+    if tick() - guiSnapAt < SNAPSHOT_EVERY then return guiSnap end
+    guiSnapAt = tick()
+    local list = {}
     local gui = LocalPlayer:FindFirstChild("PlayerGui")
-    if not gui then return nil end
-    for _, d in ipairs(gui:GetDescendants()) do
+    if gui then
+        local ok, descendants = pcall(function() return gui:GetDescendants() end)
+        if ok and descendants then
+            for _, d in ipairs(descendants) do
+                pcall(function()
+                    if d:IsA("GuiObject") then
+                        local t = d.Text
+                        if t and t ~= "" then
+                            list[#list + 1] = { obj = d, text = string.lower(t) }
+                        end
+                    end
+                end)
+            end
+        end
+    end
+    guiSnap = list
+    return list
+end
+
+local function findGuiText(matchFn)
+    for _, entry in ipairs(snapshotGui()) do
         local ok, hit = pcall(function()
-            if not d:IsA("GuiObject") then return false end
-            local t = d.Text
-            if not t or t == "" then return false end
-            return matchFn(string.lower(t)) and isShown(d)
+            return matchFn(entry.text) and isShown(entry.obj)
         end)
-        if ok and hit then return d end
+        if ok and hit then return entry.obj end
     end
     return nil
+end
+
+local function findReplayButton()
+    return findGuiText(function(t)
+        for _, w in ipairs(CFG.ReplayWords) do
+            if t:find(w, 1, true) then return true end
+        end
+        return false
+    end)
 end
 
 local function clickGui(d)
@@ -458,33 +567,47 @@ end
 local lastSkip, lastSpeed, speedTries = 0, 0, 0
 local speedDone, speedRemoteTried, speedWarned = false, 0, false
 
--- game.ReplicatedStorage.ModuleLoader.Shared.Network.RemoteEvent.ModeVote:FireServer(<mode>)
-local modeWarned = false
+-- mode vote by clicking the Vote button (the ModeVote remote didn't work).
+-- the five Vote buttons sit at fixed fractions of the window, measured on a 2576x1068 screenshot:
+--   Easy 608, Normal 946, Hard 1284, Insane 1621, Nightmare 1959 (x), 697 (y)
+local MODE_NAMES = { "Easy", "Normal", "Hard", "Insane", "Nightmare" }
+local VOTE_RX = { 0.2360, 0.3672, 0.4984, 0.6293, 0.7605 }
+local VOTE_RY = 0.6526
+local lastVoteTry = 0
 
-local function parseVoteArg(s)
-    if s == "true" then return true end
-    if s == "false" then return false end
-    return tonumber(s) or s
+local function voteTarget()
+    local vw, vh = 1920, 1080
+    pcall(function()
+        local vs = workspace.CurrentCamera.ViewportSize
+        if vs.X > 0 and vs.Y > 0 then vw, vh = vs.X, vs.Y end
+    end)
+    local i = math.max(1, math.min(5, math.floor(settings.modeVoteMode)))
+    return vw * VOTE_RX[i] + settings.modeVoteOffX, vh * VOTE_RY + settings.modeVoteOffY
 end
 
+-- returns true once the click was sent, false if the voting screen isn't up yet (it tries again)
 local function fireModeVote(force)
-    if not force and not settings.modeVoteEnabled then return false end
-    local ok, err = pcall(function()
-        local node = game:GetService("ReplicatedStorage")
-        for _, name in ipairs({ "ModuleLoader", "Shared", "Network", "RemoteEvent", "ModeVote" }) do
-            node = node:FindFirstChild(name)
-            if not node then error("missing " .. name) end
-        end
-        if settings.modeVoteArg == "" then
-            node:FireServer()
-        else
-            node:FireServer(parseVoteArg(settings.modeVoteArg))
+    if not force then
+        if not settings.modeVoteEnabled then return false end
+        if tick() - lastVoteTry < 2 then return false end
+        lastVoteTry = tick()
+        -- only click while a "Vote" button is actually on screen
+        local b = findGuiText(function(t) return t:match("^%s*vote%s*$") ~= nil end)
+        if not b then return false end
+    end
+    -- clicks only land while Roblox is the active window
+    for _ = 1, 10 do
+        if isrbxactive() then break end
+        wait(1)
+    end
+    status = "Voting " .. MODE_NAMES[settings.modeVoteMode]
+    local ok = pcall(function()
+        for n = 1, settings.modeVoteClicks do
+            local x, y = voteTarget()
+            clickAt(x, y)
+            if n < settings.modeVoteClicks then wait(0.6) end
         end
     end)
-    if not ok and not modeWarned then
-        modeWarned = true
-        notify("ModeVote remote failed: " .. tostring(err), "CTD Macro", 6)
-    end
     return ok
 end
 
@@ -496,6 +619,7 @@ end
 -- game.ReplicatedStorage.ModuleLoader.Shared.Network.RemoteEvent.PlayAgain:FireServer()
 local playWarned = false
 local function firePlayAgain()
+    if not settings.useRemotes then return false end
     local ok, err = pcall(function()
         local node = game:GetService("ReplicatedStorage")
         for _, name in ipairs({ "ModuleLoader", "Shared", "Network", "RemoteEvent", "PlayAgain" }) do
@@ -528,6 +652,7 @@ end
 local SPEED_REMOTE_PATH = { "ModuleLoader", "Shared", "Network", "RemoteFunction", "ChangeSpeed" }
 
 local function setSpeedRemote()
+    if not settings.useRemotes then return false end
     local ok, err = pcall(function()
         local node = game:GetService("ReplicatedStorage")
         for _, name in ipairs(SPEED_REMOTE_PATH) do
@@ -655,19 +780,28 @@ local function captureMouse()
     end
 end
 
-local function mainLoop()
+local function mainLoopBody()
     local lastUpgrade = 0
     local myGen = runGen
     if settings.tpEnabled then teleportHome() wait(1) end
-    if settings.camEnabled then applyCamera() end
+    if settings.camEnabled then applyCamera(true) end
     normalizeCamera()
     voteMode()
     runRoundStartClicks()
-    while running and myGen == runGen do
+    while running and myGen == runGen and isAlive() do
+        lastBeat = tick()
+        -- after a teleport the old player object can go stale, so grab it again
+        pcall(function()
+            local lp = Players.LocalPlayer
+            if lp then LocalPlayer = lp end
+        end)
         -- timers that only use remotes, so they work even if the Roblox window isn't focused
         if settings.modeVoteEnabled and not voteDone and tick() - roundStart >= settings.modeVoteAfter then
-            voteDone = true
-            fireModeVote()
+            if fireModeVote() then
+                voteDone = true
+            elseif tick() - roundStart > settings.modeVoteAfter + 60 then
+                voteDone = true -- the voting screen never showed up this round, stop looking
+            end
         end
         if settings.timedPlayAgain and tick() - roundStart >= settings.playAgainAfter then
             status = "Timed PlayAgain"
@@ -692,7 +826,7 @@ local function mainLoop()
                 voteDone = false
                 wait(settings.roundDelay)
                 if settings.tpEnabled then teleportHome() wait(1) end
-                if settings.camEnabled then applyCamera() end
+                if settings.camEnabled then applyCamera(true) end
                 normalizeCamera()
                 voteMode()
                 runRoundStartClicks()
@@ -738,15 +872,35 @@ local function mainLoop()
     status = "Stopped"
 end
 
+-- runs the main loop, and if anything errors (nil objects right after a teleport, etc.)
+-- it reports it and keeps going instead of silently dying
+local lastErrNotify = 0
+local function mainLoop()
+    while running and isAlive() do
+        local ok, err = pcall(mainLoopBody)
+        if not ok then
+            if tick() - lastErrNotify > 30 then
+                lastErrNotify = tick()
+                notify("Macro error (continuing): " .. tostring(err), "CTD Macro", 6)
+            end
+            wait(3)
+        end
+    end
+    status = "Stopped"
+end
+
 local function setRunning(v)
     if v and not running then
         if #spots == 0 then notify("Create places first (Slot buttons)", "CTD Macro", 3) return end
         runGen = runGen + 1
         running = true
+        wantRunning = true
+        lastBeat = tick()
         notify("Macro started", "CTD Macro", 2)
         task.spawn(mainLoop)
     elseif not v and running then
         running = false
+        wantRunning = false
         notify("Macro stopped", "CTD Macro", 2)
     end
 end
@@ -760,11 +914,11 @@ task.spawn(function()
         down[vk] = p
         return fresh
     end
-    while true do
+    while isAlive() do
         if isrbxactive() then
             if pressed(0x77) then setRunning(not running) end       -- F8 start/stop
         end
-        wait(0.05)
+        wait(0.1)
     end
 end)
 
@@ -773,23 +927,34 @@ end)
 -- if Matcha clears the script on teleport, put the script in Matcha's autoexec so it
 -- loads again, and turn on Auto-start.
 local function currentJobId()
+    -- the server id plus the place id, so joining a different game also counts as "new"
     local ok, id = pcall(function() return game.JobId end)
-    if ok and type(id) == "string" and id ~= "" then return id end
-    return nil
+    local ok2, pid = pcall(function() return game.PlaceId end)
+    local key = ((ok and type(id) == "string") and id or "") .. ":" .. tostring(ok2 and pid or "")
+    if key == ":" then return nil end
+    return key
 end
 
 local lastJob = currentJobId()
 
 local function onNewServer()
-    local wasRunning = running
+    if settings.unloadOnNewServer then
+        notify("New server detected - unloading so autoexec can reload", "CTD Macro", 4)
+        unload()
+        return
+    end
+    local wasRunning = wantRunning or running
     running = false
     status = "New server - refreshing"
     notify("New server detected - refreshing script", "CTD Macro", 4)
     wait(2)
     pcall(function() LocalPlayer = Players.LocalPlayer end)
+    local backupSpots = spots
     loadConfig()
     loadSpots()
     loadClicks()
+    -- if the file couldn't be read in the new server, keep the places we already had
+    if #spots == 0 and #backupSpots > 0 then spots = backupSpots end
     history = {}
     for _, sp in ipairs(spots) do sp.placed = false end
     speedDone, speedRemoteTried, speedTries, speedWarned = false, 0, 0, false
@@ -797,12 +962,14 @@ local function onNewServer()
     roundStart = tick() -- the vote and PlayAgain timers count from here
     if wasRunning or settings.autostart then
         wait(3)
+        waitForCharacter(30)
+        wait(2)
         setRunning(true)
     end
 end
 
 task.spawn(function()
-    while true do
+    while alive do
         wait(1)
         local id = currentJobId()
         if id then
@@ -813,10 +980,61 @@ task.spawn(function()
                 lastJob = id
             end
         end
+        -- watchdog: if the macro should be running but its loop stopped reporting in, restart it
+        if wantRunning and isAlive() and tick() - lastBeat > 45 then
+            lastBeat = tick()
+            notify("Macro stalled - restarting it", "CTD Macro", 4)
+            running = false
+            wait(0.5)
+            setRunning(true)
+        end
     end
 end)
 
 ---------------------------------------------------------------- menu
+-- the menu redraws every frame, so the click target shown there is only recomputed once a second
+local targetText, targetTextAt = "", 0
+local function voteTargetText()
+    if tick() - targetTextAt >= 1 then
+        targetTextAt = tick()
+        targetText = string.format("Click target: %d, %d", voteTarget())
+    end
+    return targetText
+end
+
+-- AFK farm mode: one switch that turns on everything the macro needs to run unattended,
+-- and makes it start itself every time the script loads or a new server is joined.
+local function applyAfkMode(on)
+    settings.afkMode = on
+    local function setToggle(id, key, value)
+        settings[key] = value
+        pcall(UI.SetValue, id, value)
+    end
+    if on then
+        setToggle("ctd_autostart", "autostart", true)
+        setToggle("ctd_cam_auto", "camAuto", true)
+        setToggle("ctd_mode_vote", "modeVoteEnabled", true)
+        setToggle("ctd_timed_play", "timedPlayAgain", true)
+        setToggle("ctd_autoskip", "autoSkip", true)
+        setToggle("ctd_autospeed", "autoSpeed", true)
+        setToggle("ctd_replay_remote", "useReplayRemote", true)
+        if settings.tpSet then
+            setToggle("ctd_tp_enabled", "tpEnabled", true)
+        else
+            notify("AFK mode: also set a teleport spot so it returns there on every join", "CTD Macro", 6)
+        end
+        if #spots == 0 then
+            notify("AFK mode: create your tower places first", "CTD Macro", 5)
+        end
+    else
+        setToggle("ctd_autostart", "autostart", false)
+    end
+    saveConfig()
+    if on and #spots > 0 and not running then
+        task.spawn(function() setRunning(true) end)
+    end
+end
+
 -- edits to individual places are queued and applied at the start of the next frame
 local pending = nil
 
@@ -840,6 +1058,7 @@ local function applyPending()
 end
 
 UI.AddTab("CTD Macro", function(tab)
+    if not isAlive() then return end -- unloaded or replaced by a newer copy: draw nothing
     applyPending()
     if pendingClickDel then
         table.remove(clickTargets, pendingClickDel)
@@ -847,10 +1066,12 @@ UI.AddTab("CTD Macro", function(tab)
         saveClicks()
     end
     local main = tab:Section("Macro", "Left")
+    main:Toggle("ctd_afk", "AFK farm mode (auto everything)", settings.afkMode, function(v) applyAfkMode(v) end)
     main:Button(running and "Stop (F8)" or "Start (F8)", function() setRunning(not running) end)
     main:Text("Status: " .. status)
     main:Text(string.format("Spots recorded: %d  (slot5: %d, slot1: %d)", #spots, countBySlot(5), countBySlot(1)))
     main:Spacing()
+    main:Button("Unload script", unload)
     main:Button("Undo last", undoGroup)
     main:Button("Clear all spots", clearAll)
     main:Button("Reload saved spots", function()
@@ -888,29 +1109,38 @@ UI.AddTab("CTD Macro", function(tab)
     end
 
     local mv = tab:Section("Mode vote", "Right")
-    mv:Toggle("ctd_mode_vote", "Auto pick mode (ModeVote remote)", settings.modeVoteEnabled, function(v)
+    mv:Toggle("ctd_mode_vote", "Auto pick mode (click Vote)", settings.modeVoteEnabled, function(v)
         settings.modeVoteEnabled = v
         saveConfig()
     end)
-    mv:InputText("ctd_mode_arg", "Mode value to send", settings.modeVoteArg, function(v)
-        if v ~= settings.modeVoteArg then
-            settings.modeVoteArg = v
+    mv:Combo("ctd_mode_pick", "Mode", MODE_NAMES, settings.modeVoteMode, function(v)
+        local idx = tonumber(v)
+        if not idx then
+            for i, name in ipairs(MODE_NAMES) do
+                if name == v then idx = i end
+            end
+        end
+        if idx and idx >= 1 and idx <= 5 and idx ~= settings.modeVoteMode then
+            settings.modeVoteMode = idx
             saveConfig()
         end
     end)
+    mv:SliderInt("ctd_mode_offx", "Click X offset (px)", -1000, 1000, settings.modeVoteOffX, function(v) settings.modeVoteOffX = v saveConfig() end)
+    mv:SliderInt("ctd_mode_offy", "Click Y offset (px)", -1000, 1000, settings.modeVoteOffY, function(v) settings.modeVoteOffY = v saveConfig() end)
+    mv:SliderInt("ctd_mode_clicks", "Clicks on Vote", 1, 3, settings.modeVoteClicks, function(v) settings.modeVoteClicks = v saveConfig() end)
+    mv:Text(voteTargetText())
     mv:SliderInt("ctd_mode_after", "Vote this many s after joining", 0, 60, settings.modeVoteAfter, function(v) settings.modeVoteAfter = v saveConfig() end)
     mv:Button("Test vote now", function() task.spawn(function() fireModeVote(true) end) end)
 
     local cm = tab:Section("Camera", "Right")
     cm:Text(settings.camSet and "Camera view saved" or "No camera view saved")
     cm:Button("Save current camera view", saveCamera)
-    cm:Button("Apply camera now", function() task.spawn(applyCamera) end)
-    cm:Toggle("ctd_cam_lock", "Lock camera (fixed view)", settings.camLock, function(v)
-        settings.camLock = v
+    cm:Button("Apply camera now", function() task.spawn(function() applyCamera(true) end) end)
+    cm:Toggle("ctd_cam_enabled", "Set saved camera at round start", settings.camEnabled, function(v)
+        settings.camEnabled = v
         saveConfig()
     end)
-    cm:Text("Turn lock off to move the camera, then re-save the view.")
-    cm:Text("If Matcha can't set the camera, use auto camera:")
+    cm:Text("Saved view wins over the auto camera below.")
     cm:Toggle("ctd_cam_auto", "Auto camera (zoom out + look down)", settings.camAuto, function(v)
         settings.camAuto = v
         saveConfig()
@@ -925,11 +1155,11 @@ UI.AddTab("CTD Macro", function(tab)
         settings.pitchReverse = v
         saveConfig()
     end)
-    cm:Button("Test auto camera now", function() task.spawn(function() normalizeCamera(true) end) end)
-    cm:Toggle("ctd_cam_enabled", "Set camera at start / before placing", settings.camEnabled, function(v)
-        settings.camEnabled = v
+    cm:Toggle("ctd_pitch_abs", "Drag with absolute moves (try if it won't rotate)", settings.pitchAbs, function(v)
+        settings.pitchAbs = v
         saveConfig()
     end)
+    cm:Button("Test auto camera now", function() task.spawn(function() normalizeCamera(true) end) end)
 
     local rc = tab:Section("Round start clicks", "Right")
     rc:Text("Clicked when the macro starts and after each Replay.")
@@ -981,6 +1211,14 @@ UI.AddTab("CTD Macro", function(tab)
         settings.autoSpeed = v
         saveConfig()
     end)
+    opt:Toggle("ctd_unload_new", "Unload on new server (autoexec reloads)", settings.unloadOnNewServer, function(v)
+        settings.unloadOnNewServer = v
+        saveConfig()
+    end)
+    opt:Toggle("ctd_use_remotes", "Use remotes (speed / PlayAgain)", settings.useRemotes, function(v)
+        settings.useRemotes = v
+        saveConfig()
+    end)
     opt:Toggle("ctd_timed_play", "Timed PlayAgain", settings.timedPlayAgain, function(v)
         settings.timedPlayAgain = v
         saveConfig()
@@ -1007,6 +1245,8 @@ notify("Loaded " .. tostring(loadedCount) .. " saved spots. Open the CTD Macro t
 if settings.autostart and #spots > 0 then
     task.spawn(function()
         wait(3)
+        waitForCharacter(30)
+        wait(2)
         setRunning(true)
     end)
 end
