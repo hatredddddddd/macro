@@ -168,7 +168,8 @@ local function loadConfig()
             end
         end
     end)
-    settings.camLock = false -- the constant 30x/second camera lock stays removed
+    settings.camLock = false -- camera writes don't work here, so the saved-view feature is off for good
+    settings.camEnabled = false
 end
 
 loadConfig()
@@ -1133,14 +1134,7 @@ UI.AddTab("CTD Macro", function(tab)
     mv:Button("Test vote now", function() task.spawn(function() fireModeVote(true) end) end)
 
     local cm = tab:Section("Camera", "Right")
-    cm:Text(settings.camSet and "Camera view saved" or "No camera view saved")
-    cm:Button("Save current camera view", saveCamera)
-    cm:Button("Apply camera now", function() task.spawn(function() applyCamera(true) end) end)
-    cm:Toggle("ctd_cam_enabled", "Set saved camera at round start", settings.camEnabled, function(v)
-        settings.camEnabled = v
-        saveConfig()
-    end)
-    cm:Text("Saved view wins over the auto camera below.")
+    cm:Text("Camera: zoom out + look down, using mouse input.")
     cm:Toggle("ctd_cam_auto", "Auto camera (zoom out + look down)", settings.camAuto, function(v)
         settings.camAuto = v
         saveConfig()
