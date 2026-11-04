@@ -45,10 +45,16 @@ local settings = {
     modeVoteOffX = 400,   -- pixel nudge added to the calculated click position
     modeVoteOffY = 0,
     modeVoteClicks = 1,   -- how many times to click the Vote button
+    modeVoteBlind = true, -- if the voting screen is never detected, click the Vote spot anyway after a while
+    winW = 0,             -- window size override in px (0 = read it from the game)
+    winH = 0,
     modeVoteAfter = 8,    -- seconds after joining the server / starting a round before voting
     timedPlayAgain = true, -- fire PlayAgain on a timer instead of waiting for the Replay button
-    playAgainAfter = 386, -- seconds after the round starts (386 = 6:26)
+    playAgainSecs = 605,  -- seconds after the round starts before PlayAgain fires (605 = 10:05)
     unloadOnNewServer = false, -- unload completely on a new server so autoexec can run a fresh copy
+    stuckSecs = 240,      -- no progress (cash change, placement, vote, replay) for this long = stuck, force a replay (0 = off)
+    antiIdle = true,      -- tiny mouse wiggle every 2 minutes so Roblox never counts you as idle
+    placeVerify = true,   -- check that cash dropped after a placement and retry it if it didn't
     autoSpeed = false,    -- set game speed (default 1.5x) through the ChangeSpeed remote
     gameSpeed = 1.5,      -- speed value sent to the remote
     skipEvery = 2,        -- seconds between skip checks
@@ -74,6 +80,19 @@ local roundStart = tick()  -- when this server/round began (script load, new ser
 local voteDone = false     -- mode vote already sent for this round
 local runGen = 0           -- bumps on every start so an old loop can't keep running
 
+-- all-day farming bookkeeping
+local stats = { rounds = 0, stuck = 0, retries = 0, startedAt = tick() }
+local lastProgress = tick()   -- last time anything useful happened (cash moved, tower placed, vote, replay)
+local lastIdle = tick()       -- last anti-idle wiggle
+local lastCashSeen = nil      -- last cash value the watchdog saw
+local function markProgress() lastProgress = tick() end
+local function saveStats()
+    local secs = math.floor(tick() - stats.startedAt)
+    pcall(writefile, "ctd_stats.txt", string.format(
+        "rounds=%d\nstuck_fixes=%d\nplacement_retries=%d\nuptime_seconds=%d\n",
+        stats.rounds, stats.stuck, stats.retries, secs))
+end
+
 -- instance guard: a copy of the script stops its own loops when a newer copy has loaded.
 -- this only compares a number, it never calls anything left over from an old copy,
 -- so restarting the LuaVM can't run stale code.
@@ -95,6 +114,20 @@ local function unload()
     status = "Unloaded"
     pcall(notify, "CTD Macro unloaded", "CTD Macro", 3)
 end
+
+-- LocalPlayer goes stale when you teleport to a new server, because the game's objects are
+-- rebuilt. The Players service captured when the script loaded goes stale too, so ask the game
+-- for it again every second. Without this the macro keeps erroring on dead references and
+-- looks "paused" after every join.
+task.spawn(function()
+    while isAlive() do
+        pcall(function()
+            local p = game:GetService("Players").LocalPlayer
+            if p then LocalPlayer = p end
+        end)
+        wait(1)
+    end
+end)
 
 ---------------------------------------------------------------- persistence
 local function saveSpots()
@@ -198,6 +231,18 @@ local function clickWorld(pos)
     if not on then return false end
     clickAt(sp.X, sp.Y)
     return true
+end
+
+-- game window size in pixels. returns width, height, and whether it was really read
+-- (false = the 1920x1080 guess). the winW / winH settings override it.
+local function windowSize()
+    if settings.winW > 0 and settings.winH > 0 then return settings.winW, settings.winH, true end
+    local vw, vh, ok = 1920, 1080, false
+    pcall(function()
+        local vs = game:GetService("Workspace").CurrentCamera.ViewportSize
+        if vs.X > 0 and vs.Y > 0 then vw, vh, ok = vs.X, vs.Y, true end
+    end)
+    return vw, vh, ok
 end
 
 ---------------------------------------------------------------- cash
@@ -415,11 +460,7 @@ local function normalizeCamera(force)
         -- make sure injected mouse input is allowed to reach the game
         pcall(setrobloxinput, true)
         -- start from the middle of the window so the drag isn't over a button or menu
-        local vw, vh = 1920, 1080
-        pcall(function()
-            local vs = workspace.CurrentCamera.ViewportSize
-            if vs.X > 0 and vs.Y > 0 then vw, vh = vs.X, vs.Y end
-        end)
+        local vw, vh = windowSize()
         local cx, cy = math.floor(vw / 2), math.floor(vh / 2)
         mousemoveabs(cx, cy)
         wait(0.2)
@@ -474,12 +515,31 @@ local function placeSpot(s)
     if settings.camEnabled then applyCamera() end
     local key = CFG.SlotKeys[s.slot]
     if not key then return end
+    local before = getCash()
     tap(key)
     wait(0.2)
     if clickWorld(s.pos - Vector3.new(0, settings.groundOffset, 0)) then
         s.placed = true
         wait(0.3)
         if CFG.CancelKey then tap(CFG.CancelKey) end
+        local ok = true
+        if settings.placeVerify then
+            wait(0.5) -- give the server a moment to take the money
+            local after = getCash()
+            local cost = CFG.Costs[s.slot]
+            -- cash should have dropped by roughly the tower's cost. income can hide part of it,
+            -- so only call it a failure if less than half the cost went missing
+            if before and after and cost and after > before - cost * 0.5 then
+                if s.failRound ~= roundStart then s.failRound = roundStart s.fails = 0 end
+                s.fails = (s.fails or 0) + 1
+                if s.fails < 4 then
+                    s.placed = false -- try this spot again
+                    stats.retries = stats.retries + 1
+                    ok = false
+                end
+            end
+        end
+        if ok then markProgress() end
     end
 end
 
@@ -575,26 +635,41 @@ local MODE_NAMES = { "Easy", "Normal", "Hard", "Insane", "Nightmare" }
 local VOTE_RX = { 0.2360, 0.3672, 0.4984, 0.6293, 0.7605 }
 local VOTE_RY = 0.6526
 local lastVoteTry = 0
+local votePrev, votePresentSince = false, 0 -- is a Vote button on screen / since when
 
 local function voteTarget()
-    local vw, vh = 1920, 1080
-    pcall(function()
-        local vs = workspace.CurrentCamera.ViewportSize
-        if vs.X > 0 and vs.Y > 0 then vw, vh = vs.X, vs.Y end
-    end)
+    local vw, vh = windowSize()
     local i = math.max(1, math.min(5, math.floor(settings.modeVoteMode)))
     return vw * VOTE_RX[i] + settings.modeVoteOffX, vh * VOTE_RY + settings.modeVoteOffY
 end
 
--- returns true once the click was sent, false if the voting screen isn't up yet (it tries again)
+-- hover first, then press and release: some buttons ignore a click that arrives with no hover
+local function voteClick(x, y)
+    mousemoveabs(math.floor(x) - 6, math.floor(y) - 6)
+    wait(0.1)
+    mousemoveabs(math.floor(x), math.floor(y))
+    wait(0.25)
+    mouse1press()
+    wait(0.08)
+    mouse1release()
+end
+
+-- returns true once the click was sent; false means "try again later"
 local function fireModeVote(force)
     if not force then
         if not settings.modeVoteEnabled then return false end
         if tick() - lastVoteTry < 2 then return false end
         lastVoteTry = tick()
-        -- only click while a "Vote" button is actually on screen
         local b = findGuiText(function(t) return t:match("^%s*vote%s*$") ~= nil end)
-        if not b then return false end
+        if not b then
+            -- never saw a Vote button: after a while click the spot anyway (a stray click in a
+            -- running match does nothing harmful), otherwise keep waiting for the screen
+            if settings.modeVoteBlind and tick() - roundStart >= settings.modeVoteAfter + 12 then
+                notify("Vote screen not detected - clicking the Vote spot anyway", "CTD Macro", 4)
+            else
+                return false
+            end
+        end
     end
     -- clicks only land while Roblox is the active window
     for _ = 1, 10 do
@@ -602,13 +677,17 @@ local function fireModeVote(force)
         wait(1)
     end
     status = "Voting " .. MODE_NAMES[settings.modeVoteMode]
+    local cx, cy = 0, 0
     local ok = pcall(function()
         for n = 1, settings.modeVoteClicks do
-            local x, y = voteTarget()
-            clickAt(x, y)
+            cx, cy = voteTarget()
+            voteClick(cx, cy)
             if n < settings.modeVoteClicks then wait(0.6) end
         end
     end)
+    if ok then
+        notify(string.format("Clicked Vote (%s) at %d, %d", MODE_NAMES[settings.modeVoteMode], cx, cy), "CTD Macro", 3)
+    end
     return ok
 end
 
@@ -793,9 +872,58 @@ local function mainLoopBody()
         lastBeat = tick()
         -- after a teleport the old player object can go stale, so grab it again
         pcall(function()
-            local lp = Players.LocalPlayer
+            local lp = game:GetService("Players").LocalPlayer
             if lp then LocalPlayer = lp end
         end)
+        -- a Vote button appearing means a new match is starting. this re-arms everything even
+        -- if the server change itself was never detected
+        local votePresent = findGuiText(function(t) return t:match("^%s*vote%s*$") ~= nil end) ~= nil
+        if votePresent and not votePrev then
+            votePresentSince = tick()
+            roundStart = tick()
+            voteDone = false
+            speedDone, speedRemoteTried, speedTries = false, 0, 0
+            for _, sp in ipairs(spots) do sp.placed = false end
+            status = "Voting screen up"
+            markProgress()
+        end
+        votePrev = votePresent
+
+        -- anti-idle: Roblox kicks after ~20 minutes with no input, so wiggle the mouse now and then
+        if settings.antiIdle and tick() - lastIdle > 120 then
+            lastIdle = tick()
+            if isrbxactive() then
+                pcall(function()
+                    mousemoverel(1, 0)
+                    wait(0.05)
+                    mousemoverel(-1, 0)
+                end)
+            end
+        end
+
+        -- stuck watchdog: cash keeps changing in a healthy match. if nothing useful happens for
+        -- stuckSecs, force a replay and start the round over instead of idling all night
+        local cashNow = getCash()
+        if cashNow and cashNow ~= lastCashSeen then
+            lastCashSeen = cashNow
+            markProgress()
+        end
+        if settings.stuckSecs > 0 and tick() - lastProgress > settings.stuckSecs then
+            stats.stuck = stats.stuck + 1
+            stats.rounds = stats.rounds + 1
+            lastProgress = tick()
+            notify("No progress for " .. settings.stuckSecs .. "s - forcing a replay", "CTD Macro", 5)
+            if not firePlayAgain() then
+                local rb = findReplayButton()
+                if rb then clickGui(rb) end
+            end
+            saveStats()
+            roundStart = tick()
+            voteDone = false
+            speedDone, speedRemoteTried, speedTries = false, 0, 0
+            for _, sp in ipairs(spots) do sp.placed = false end
+        end
+
         -- timers that only use remotes, so they work even if the Roblox window isn't focused
         if settings.modeVoteEnabled and not voteDone and tick() - roundStart >= settings.modeVoteAfter then
             if fireModeVote() then
@@ -804,8 +932,11 @@ local function mainLoopBody()
                 voteDone = true -- the voting screen never showed up this round, stop looking
             end
         end
-        if settings.timedPlayAgain and tick() - roundStart >= settings.playAgainAfter then
+        if settings.timedPlayAgain and tick() - roundStart >= settings.playAgainSecs then
             status = "Timed PlayAgain"
+            stats.rounds = stats.rounds + 1
+            markProgress()
+            saveStats()
             firePlayAgain()
             roundStart = tick()
             voteDone = false
@@ -816,6 +947,9 @@ local function mainLoopBody()
             local btn = findReplayButton()
             if btn then
                 status = "Replaying..."
+                stats.rounds = stats.rounds + 1
+                markProgress()
+                saveStats()
                 if not (settings.useReplayRemote and firePlayAgain()) then
                     local p, s = btn.AbsolutePosition, btn.AbsoluteSize
                     clickAt(p.X + s.X / 2, p.Y + s.Y / 2 + settings.insetY)
@@ -831,6 +965,10 @@ local function mainLoopBody()
                 normalizeCamera()
                 voteMode()
                 runRoundStartClicks()
+            elseif votePresent and tick() - votePresentSince < 90 then
+                -- towers can't be placed until voting ends, so don't waste clicks (and don't
+                -- mark spots as placed) while the vote screen is up. gives up after 90s.
+                status = "Waiting for voting to finish"
             else
                 autoUtilities()
                 local didSomething = false
@@ -897,6 +1035,7 @@ local function setRunning(v)
         running = true
         wantRunning = true
         lastBeat = tick()
+        markProgress()
         notify("Macro started", "CTD Macro", 2)
         task.spawn(mainLoop)
     elseif not v and running then
@@ -949,7 +1088,7 @@ local function onNewServer()
     status = "New server - refreshing"
     notify("New server detected - refreshing script", "CTD Macro", 4)
     wait(2)
-    pcall(function() LocalPlayer = Players.LocalPlayer end)
+    pcall(function() LocalPlayer = game:GetService("Players").LocalPlayer end)
     local backupSpots = spots
     loadConfig()
     loadSpots()
@@ -961,6 +1100,7 @@ local function onNewServer()
     speedDone, speedRemoteTried, speedTries, speedWarned = false, 0, 0, false
     voteDone = false
     roundStart = tick() -- the vote and PlayAgain timers count from here
+    markProgress()
     if wasRunning or settings.autostart then
         wait(3)
         waitForCharacter(30)
@@ -970,16 +1110,23 @@ local function onNewServer()
 end
 
 task.spawn(function()
-    while alive do
+    local gapCount, sawGap, lastNewServerAt = 0, false, 0
+    while isAlive() do
         wait(1)
         local id = currentJobId()
         if id then
-            if lastJob and id ~= lastJob then
-                lastJob = id
+            -- a changed server id is a new server. so is the id becoming readable again after
+            -- being unreadable for a couple of seconds (that is what a teleport looks like)
+            local changed = (lastJob and id ~= lastJob) or sawGap
+            gapCount, sawGap = 0, false
+            lastJob = id
+            if changed and tick() - lastNewServerAt > 20 then
+                lastNewServerAt = tick()
                 onNewServer()
-            else
-                lastJob = id
             end
+        else
+            gapCount = gapCount + 1
+            if gapCount >= 2 then sawGap = true end
         end
         -- watchdog: if the macro should be running but its loop stopped reporting in, restart it
         if wantRunning and isAlive() and tick() - lastBeat > 45 then
@@ -998,7 +1145,9 @@ local targetText, targetTextAt = "", 0
 local function voteTargetText()
     if tick() - targetTextAt >= 1 then
         targetTextAt = tick()
-        targetText = string.format("Click target: %d, %d", voteTarget())
+        local tx, ty = voteTarget()
+        local vw, vh, read = windowSize()
+        targetText = string.format("Click target: %d, %d  (window %dx%d%s)", tx, ty, vw, vh, read and "" or " ASSUMED")
     end
     return targetText
 end
@@ -1070,6 +1219,11 @@ UI.AddTab("CTD Macro", function(tab)
     main:Toggle("ctd_afk", "AFK farm mode (auto everything)", settings.afkMode, function(v) applyAfkMode(v) end)
     main:Button(running and "Stop (F8)" or "Start (F8)", function() setRunning(not running) end)
     main:Text("Status: " .. status)
+    do
+        local up = math.floor(tick() - stats.startedAt)
+        main:Text(string.format("Rounds: %d   Stuck fixes: %d   Retries: %d   Up: %dh %dm",
+            stats.rounds, stats.stuck, stats.retries, math.floor(up / 3600), math.floor(up % 3600 / 60)))
+    end
     main:Text(string.format("Spots recorded: %d  (slot5: %d, slot1: %d)", #spots, countBySlot(5), countBySlot(1)))
     main:Spacing()
     main:Button("Unload script", unload)
@@ -1130,6 +1284,12 @@ UI.AddTab("CTD Macro", function(tab)
     mv:SliderInt("ctd_mode_offy", "Click Y offset (px)", -1000, 1000, settings.modeVoteOffY, function(v) settings.modeVoteOffY = v saveConfig() end)
     mv:SliderInt("ctd_mode_clicks", "Clicks on Vote", 1, 3, settings.modeVoteClicks, function(v) settings.modeVoteClicks = v saveConfig() end)
     mv:Text(voteTargetText())
+    mv:Toggle("ctd_mode_blind", "Click anyway if Vote screen not seen", settings.modeVoteBlind, function(v)
+        settings.modeVoteBlind = v
+        saveConfig()
+    end)
+    mv:SliderInt("ctd_win_w", "Window width override (0 = auto)", 0, 7680, settings.winW, function(v) settings.winW = v saveConfig() end)
+    mv:SliderInt("ctd_win_h", "Window height override (0 = auto)", 0, 4320, settings.winH, function(v) settings.winH = v saveConfig() end)
     mv:SliderInt("ctd_mode_after", "Vote this many s after joining", 0, 60, settings.modeVoteAfter, function(v) settings.modeVoteAfter = v saveConfig() end)
     mv:Button("Test vote now", function() task.spawn(function() fireModeVote(true) end) end)
 
@@ -1205,6 +1365,15 @@ UI.AddTab("CTD Macro", function(tab)
         settings.autoSpeed = v
         saveConfig()
     end)
+    opt:Toggle("ctd_anti_idle", "Anti-idle wiggle (every 2 min)", settings.antiIdle, function(v)
+        settings.antiIdle = v
+        saveConfig()
+    end)
+    opt:Toggle("ctd_place_verify", "Verify placements (retry if cash didn't drop)", settings.placeVerify, function(v)
+        settings.placeVerify = v
+        saveConfig()
+    end)
+    opt:SliderInt("ctd_stuck_secs", "Stuck watchdog (s, 0 = off)", 0, 900, settings.stuckSecs, function(v) settings.stuckSecs = v saveConfig() end)
     opt:Toggle("ctd_unload_new", "Unload on new server (autoexec reloads)", settings.unloadOnNewServer, function(v)
         settings.unloadOnNewServer = v
         saveConfig()
@@ -1217,7 +1386,7 @@ UI.AddTab("CTD Macro", function(tab)
         settings.timedPlayAgain = v
         saveConfig()
     end)
-    opt:SliderInt("ctd_play_after", "PlayAgain after (s)  386 = 6:26", 30, 900, settings.playAgainAfter, function(v) settings.playAgainAfter = v saveConfig() end)
+    opt:SliderInt("ctd_play_secs", "PlayAgain after (s)  605 = 10:05", 30, 1800, settings.playAgainSecs, function(v) settings.playAgainSecs = v saveConfig() end)
     opt:Toggle("ctd_replay_remote", "Replay via PlayAgain remote", settings.useReplayRemote, function(v)
         settings.useReplayRemote = v
         saveConfig()
