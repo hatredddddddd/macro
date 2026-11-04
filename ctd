@@ -1035,9 +1035,12 @@ local function mainLoop()
     status = "Stopped"
 end
 
+local userStopped = false -- true after you press Stop / F8, so auto-start doesn't fight you
+
 local function setRunning(v)
     if v and not running then
         if #spots == 0 then notify("Create places first (Slot buttons)", "CTD Macro", 3) return end
+        userStopped = false
         runGen = runGen + 1
         running = true
         wantRunning = true
@@ -1046,10 +1049,25 @@ local function setRunning(v)
         notify("Macro started", "CTD Macro", 2)
         task.spawn(mainLoop)
     elseif not v and running then
+        userStopped = true
         running = false
         wantRunning = false
         notify("Macro stopped", "CTD Macro", 2)
     end
+end
+
+-- start the macro by itself: wait for the character, wait startDelay, then start.
+-- safe to call as often as you like, it only ever runs one start at a time.
+local starting = false
+local function autoStartNow()
+    if starting or running then return end
+    starting = true
+    task.spawn(function()
+        waitForCharacter(30)
+        wait(settings.startDelay)
+        if isAlive() and not running and not userStopped then setRunning(true) end
+        starting = false
+    end)
 end
 
 ---------------------------------------------------------------- hotkeys
@@ -1108,7 +1126,7 @@ local function onNewServer()
     voteDone = false
     roundStart = tick() -- the vote and PlayAgain timers count from here
     markProgress()
-    if wasRunning or settings.autostart then
+    if wasRunning or settings.autostart or settings.afkMode then
         waitForCharacter(30)
         wait(settings.startDelay)
         setRunning(true)
@@ -1133,6 +1151,13 @@ task.spawn(function()
         else
             gapCount = gapCount + 1
             if gapCount >= 2 then sawGap = true end
+        end
+        -- auto-start supervisor: if auto-start (or AFK mode) is on and the macro isn't running,
+        -- start it, whatever the reason it isn't (a join we didn't detect, a stop after an error...).
+        -- it leaves the macro alone once you have pressed Stop yourself.
+        if (settings.autostart or settings.afkMode) and not running and not userStopped
+            and not starting and #spots > 0 then
+            autoStartNow()
         end
         -- watchdog: if the macro should be running but its loop stopped reporting in, restart it
         if wantRunning and isAlive() and tick() - lastBeat > 45 then
@@ -1225,7 +1250,9 @@ UI.AddTab("CTD Macro", function(tab)
         saveClicks()
     end
     local main = tab:Section("Macro", "Left")
-    main:Toggle("ctd_afk", "AFK farm mode (auto everything)", settings.afkMode, function(v) applyAfkMode(v) end)
+    main:Toggle("ctd_afk", "AFK farm mode (auto everything)", settings.afkMode, function(v)
+        if v ~= settings.afkMode then applyAfkMode(v) end -- ignore calls that change nothing
+    end)
     main:Button(running and "Stop (F8)" or "Start (F8)", function() setRunning(not running) end)
     main:Text("Status: " .. status)
     do
@@ -1416,10 +1443,14 @@ end)
 notify("Loaded " .. tostring(loadedCount) .. " saved spots. Open the CTD Macro tab to start.", "CTD Macro", 5)
 
 -- keep using it: resume automatically if auto-start is on
-if settings.autostart and #spots > 0 then
-    task.spawn(function()
-        waitForCharacter(30)
-        wait(settings.startDelay)
-        setRunning(true)
-    end)
+-- and say why it did or didn't, so a missing auto-start is never a mystery
+if settings.autostart or settings.afkMode then
+    if #spots == 0 then
+        notify("Auto-start is on but no places are saved - create places first", "CTD Macro", 6)
+    else
+        notify("Auto-start on - starting " .. tostring(settings.startDelay) .. "s after your character loads", "CTD Macro", 4)
+        autoStartNow()
+    end
+else
+    notify("Auto-start is OFF - turn on AFK farm mode (or Auto-start) in the menu", "CTD Macro", 6)
 end
