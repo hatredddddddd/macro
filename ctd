@@ -52,6 +52,8 @@ local settings = {
     timedPlayAgain = true, -- fire PlayAgain on a timer instead of waiting for the Replay button
     playAgainSecs = 605,  -- seconds after the round starts before PlayAgain fires (605 = 10:05)
     unloadOnNewServer = false, -- unload completely on a new server so autoexec can run a fresh copy
+    startDelay = 4,       -- seconds the macro waits (after your character loads) before starting itself
+    camDelay = 4,         -- seconds after the macro starts before the camera is changed
     stuckSecs = 240,      -- no progress (cash change, placement, vote, replay) for this long = stuck, force a replay (0 = off)
     antiIdle = true,      -- tiny mouse wiggle every 2 minutes so Roblox never counts you as idle
     placeVerify = true,   -- check that cash dropped after a placement and retry it if it didn't
@@ -864,6 +866,11 @@ local function mainLoopBody()
     local lastUpgrade = 0
     local myGen = runGen
     if settings.tpEnabled then teleportHome() wait(1) end
+    -- let the game settle for a few seconds after the macro starts before touching the camera
+    for _ = 1, settings.camDelay * 4 do
+        if not running then return end
+        wait(0.25)
+    end
     if settings.camEnabled then applyCamera(true) end
     normalizeCamera()
     voteMode()
@@ -1102,9 +1109,8 @@ local function onNewServer()
     roundStart = tick() -- the vote and PlayAgain timers count from here
     markProgress()
     if wasRunning or settings.autostart then
-        wait(3)
         waitForCharacter(30)
-        wait(2)
+        wait(settings.startDelay)
         setRunning(true)
     end
 end
@@ -1181,7 +1187,10 @@ local function applyAfkMode(on)
     end
     saveConfig()
     if on and #spots > 0 and not running then
-        task.spawn(function() setRunning(true) end)
+        task.spawn(function()
+            wait(settings.startDelay)
+            setRunning(true)
+        end)
     end
 end
 
@@ -1365,6 +1374,8 @@ UI.AddTab("CTD Macro", function(tab)
         settings.autoSpeed = v
         saveConfig()
     end)
+    opt:SliderInt("ctd_start_delay", "Wait before auto-starting (s)", 0, 30, settings.startDelay, function(v) settings.startDelay = v saveConfig() end)
+    opt:SliderInt("ctd_cam_delay", "Wait before camera change (s)", 0, 30, settings.camDelay, function(v) settings.camDelay = v saveConfig() end)
     opt:Toggle("ctd_anti_idle", "Anti-idle wiggle (every 2 min)", settings.antiIdle, function(v)
         settings.antiIdle = v
         saveConfig()
@@ -1407,9 +1418,8 @@ notify("Loaded " .. tostring(loadedCount) .. " saved spots. Open the CTD Macro t
 -- keep using it: resume automatically if auto-start is on
 if settings.autostart and #spots > 0 then
     task.spawn(function()
-        wait(3)
         waitForCharacter(30)
-        wait(2)
+        wait(settings.startDelay)
         setRunning(true)
     end)
 end
