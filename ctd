@@ -7,6 +7,8 @@
 --
 -- "Towers per click" sliders set how many towers each button records (slot 1 = 9, slot 5 = 2).
 
+local BUILD = "2026-11-05 tp-to-spot v2" -- shown in the menu and the load message, so you can tell which copy is running
+
 local Players = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
 
@@ -57,6 +59,19 @@ local settings = {
     stuckSecs = 240,      -- no progress (cash change, placement, vote, replay) for this long = stuck, force a replay (0 = off)
     antiIdle = true,      -- tiny mouse wiggle every 2 minutes so Roblox never counts you as idle
     placeVerify = true,   -- check that cash dropped after a placement and retry it if it didn't
+    fireOnWin = true,     -- fire the PlayAgain remote as soon as "You Won!" shows on screen
+    placeByRemote = true, -- place towers with the game's TowerAdd remote (falls back to clicking if that fails)
+    upgradeByRemote = true, -- upgrade with the TowerUpgrade remote (falls back to click + upgrade key)
+    matchRadius = 2.5,    -- studs: how close a tower in workspace.Game.Towers must be to a spot to count as that spot's tower
+    tpToSpot = true,      -- teleport next to a spot before clicking on it, so the camera follows and the spot is always on screen
+    spotStandOff = 5,     -- studs behind the spot you stand, so you don't block the placement
+    -- unit name + unit id the game expects for each hotbar slot (copied from a remote spy).
+    -- a slot with an empty name or id is placed by clicking instead.
+    unit1Name = "Werewolf Speakerman", unit1Id = "1fbc0cd6-7c82-4cfd-b9e3-d1b1041a3d00",
+    unit2Name = "", unit2Id = "",
+    unit3Name = "", unit3Id = "",
+    unit4Name = "", unit4Id = "",
+    unit5Name = "Ninja Cameraman", unit5Id = "4c24ad4b-1652-4150-ac0d-d22a65bb4bd9",
     autoSpeed = false,    -- set game speed (default 1.5x) through the ChangeSpeed remote
     gameSpeed = 1.5,      -- speed value sent to the remote
     skipEvery = 2,        -- seconds between skip checks
@@ -87,6 +102,7 @@ local stats = { rounds = 0, stuck = 0, retries = 0, startedAt = tick() }
 local lastProgress = tick()   -- last time anything useful happened (cash moved, tower placed, vote, replay)
 local lastIdle = tick()       -- last anti-idle wiggle
 local lastCashSeen = nil      -- last cash value the watchdog saw
+local lastWinFire = 0         -- when "You Won!" last triggered a replay (so it can't fire twice for one win)
 local function markProgress() lastProgress = tick() end
 local function saveStats()
     local secs = math.floor(tick() - stats.startedAt)
@@ -449,6 +465,8 @@ end
 
 local function normalizeCamera(force)
     if not force and not settings.camAuto then return end
+    -- teleporting to each spot keeps it on screen, so no zoom / tilt is needed
+    if not force and settings.tpToSpot then return end
     -- a saved camera view takes priority over the zoom-out / look-down reset
     if not force and settings.camEnabled and settings.camSet then return end
     local zdir = settings.zoomReverse and 1 or -1 -- wheel down = zoom out
@@ -513,8 +531,34 @@ local function teleportHome()
     return moved and true or false
 end
 
-local function placeSpot(s)
+-- stand next to a spot before clicking on it. the game's camera follows your character, so the
+-- spot is always on screen and the camera never needs zooming or tilting.
+local lastOffWarn = 0
+local function teleportToSpot(s)
+    if not settings.tpToSpot then return end
+    local hrp = myRoot()
+    if not hrp then return end
+    -- stand BEHIND the spot as the camera sees it, so the spot ends up in front of the camera.
+    -- (a fixed world direction can put the spot behind the camera, which is off screen)
+    local dx, dz = 0, 1
+    pcall(function()
+        local look = game:GetService("Workspace").CurrentCamera.CFrame.LookVector
+        local len = math.sqrt(look.X * look.X + look.Z * look.Z)
+        if len > 0.01 then dx, dz = -look.X / len, -look.Z / len end
+    end)
+    local p = s.pos + Vector3.new(dx * settings.spotStandOff, 0, dz * settings.spotStandOff)
+    pcall(function() hrp.CFrame = CFrame.new(p.X, p.Y, p.Z) end)
+    wait(0.4) -- let the camera catch up with you
+    local _, on = WorldToScreen(s.pos - Vector3.new(0, settings.groundOffset, 0))
+    if not on and tick() - lastOffWarn > 10 then
+        lastOffWarn = tick()
+        notify("Spot is still off screen after teleporting - try 'Stand this far behind' = 0", "CTD Macro", 6)
+    end
+end
+
+local function placeSpotClick(s)
     if settings.camEnabled then applyCamera() end
+    teleportToSpot(s)
     local key = CFG.SlotKeys[s.slot]
     if not key then return end
     local before = getCash()
@@ -545,7 +589,297 @@ local function placeSpot(s)
     end
 end
 
+-- placing with the game's own remote, no clicking and no camera needed:
+-- game.ReplicatedStorage.ModuleLoader.Shared.Network.RemoteEvent.TowerAdd:FireServer({
+--     Pos = Vector3, CFrame = CFrame, Name = "<unit name>", UnitId = "<unit id>" })
+-- switched off for now: placing and upgrading use "teleport next to the spot + click" instead.
+-- set this to true to bring the remote placing, remote upgrading and their menu back.
+local USE_TOWER_REMOTES = false
+
+local TOWER_ADD_PATH = { "ModuleLoader", "Shared", "Network", "RemoteEvent", "TowerAdd" }
+local towerWarned = false
+
+local function unitReady(slot)
+    local name = settings["unit" .. slot .. "Name"]
+    local id = settings["unit" .. slot .. "Id"]
+    return type(name) == "string" and name ~= "" and type(id) == "string" and id ~= ""
+end
+
+local function placeByRemote(s)
+    if not unitReady(s.slot) then return false end
+    local ok, err = pcall(function()
+        local node = game:GetService("ReplicatedStorage")
+        for _, n in ipairs(TOWER_ADD_PATH) do
+            node = node:FindFirstChild(n)
+            if not node then error("missing " .. n) end
+        end
+        -- recorded spots are where your character stood, the game wants the ground point
+        local p = s.pos - Vector3.new(0, settings.groundOffset, 0)
+        node:FireServer({
+            ["Pos"] = p,
+            ["CFrame"] = CFrame.new(p.X, p.Y, p.Z),
+            ["Name"] = settings["unit" .. s.slot .. "Name"],
+            ["UnitId"] = settings["unit" .. s.slot .. "Id"],
+        })
+    end)
+    if not ok and not towerWarned then
+        towerWarned = true
+        notify("TowerAdd remote failed (" .. tostring(err) .. "), placing by clicking instead", "CTD Macro", 6)
+    end
+    return ok
+end
+
+-- remote first. if cash doesn't drop twice in a row for a spot, the clicking method takes over
+local function placeSpot(s)
+    s.towerId = nil -- a new tower is about to exist here, so forget the id of the old one
+    local failsNow = (s.failRound == roundStart and s.fails) or 0
+    if USE_TOWER_REMOTES and settings.placeByRemote and unitReady(s.slot) and failsNow < 2 then
+        local before = getCash()
+        if placeByRemote(s) then
+            s.placed = true
+            wait(0.8) -- give the server a moment to take the money
+            local after = getCash()
+            local cost = CFG.Costs[s.slot]
+            if settings.placeVerify and before and after and cost and after > before - cost * 0.5 then
+                if s.failRound ~= roundStart then s.failRound = roundStart s.fails = 0 end
+                s.fails = (s.fails or 0) + 1
+                s.placed = false
+                stats.retries = stats.retries + 1
+            else
+                markProgress()
+            end
+            return
+        end
+    end
+    placeSpotClick(s)
+end
+
+-- upgrading with the game's own remote. every placed tower is a child of
+-- game.Workspace.Game.Towers and has its own id; the remote needs that id:
+-- game.ReplicatedStorage.ModuleLoader.Shared.Network.RemoteEvent.TowerUpgrade:FireServer({ ["Id"] = "<tower id>" })
+local TOWER_UPGRADE_PATH = { "ModuleLoader", "Shared", "Network", "RemoteEvent", "TowerUpgrade" }
+local upgradeWarned = false
+local GUID = "^%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x$"
+
+local function towersFolder()
+    local f
+    pcall(function()
+        f = game:GetService("Workspace"):FindFirstChild("Game"):FindFirstChild("Towers")
+    end)
+    return f
+end
+
+-- the tower's id: an Id attribute / Id value object if it has one, otherwise its name
+local function towerIdOf(t)
+    local id
+    for _, k in ipairs({ "Id", "ID", "TowerId", "Guid", "UUID" }) do
+        pcall(function()
+            local a = t:GetAttribute(k)
+            if type(a) == "string" and a ~= "" then id = id or a end
+        end)
+        pcall(function()
+            local c = t:FindFirstChild(k)
+            if c then
+                local v = c.Value
+                if type(v) == "string" and v ~= "" then id = id or v end
+            end
+        end)
+        if id then return id end
+    end
+    local name
+    pcall(function() name = t.Name end)
+    if type(name) == "string" and name:match(GUID) then return name end
+    return nil
+end
+
+-- where the tower stands
+local function towerPos(t)
+    local p
+    pcall(function()
+        if t:IsA("BasePart") then p = t.Position return end
+        local r = t:FindFirstChild("HumanoidRootPart")
+        if r then p = r.Position return end
+        local pp = t.PrimaryPart
+        if pp then p = pp.Position return end
+    end)
+    if p then return p end
+    pcall(function()
+        for _, d in ipairs(t:GetDescendants()) do
+            if d:IsA("BasePart") then p = d.Position return end
+        end
+    end)
+    return p
+end
+
+-- is it yours? only used to prefer your tower when two are close together
+local function ownedByMe(t)
+    local mine = false
+    local known = false
+    local me = LocalPlayer.Name
+    local uid = tostring(LocalPlayer.UserId)
+    for _, k in ipairs({ "Owner", "OwnerName", "Player", "PlayerName", "OwnerId", "UserId" }) do
+        pcall(function()
+            local v = t:GetAttribute(k)
+            if v ~= nil then
+                known = true
+                if tostring(v) == me or tostring(v) == uid then mine = true end
+            end
+        end)
+        pcall(function()
+            local c = t:FindFirstChild(k)
+            if c then
+                local v = c.Value
+                known = true
+                if tostring(v) == me or tostring(v) == uid then mine = true end
+            end
+        end)
+    end
+    if not known then return true end
+    return mine
+end
+
+-- reading every tower costs memory reads, so it is cached for a couple of seconds
+-- and only done when a spot actually needs its tower id looked up
+local towerSnap, towerSnapAt = {}, 0
+local function snapshotTowers()
+    if tick() - towerSnapAt < 2 then return towerSnap end
+    towerSnapAt = tick()
+    local list = {}
+    local folder = towersFolder()
+    if folder then
+        local ok, kids = pcall(function() return folder:GetChildren() end)
+        if ok and kids then
+            for _, t in ipairs(kids) do
+                local id = towerIdOf(t)
+                local pos = towerPos(t)
+                if id and pos then list[#list + 1] = { id = id, pos = pos, mine = ownedByMe(t) } end
+            end
+        end
+    end
+    towerSnap = list
+    return list
+end
+
+-- find the tower that stands on this spot (nearest one, preferring yours, never one that
+-- already belongs to another spot)
+local function towerIdFor(s)
+    if s.towerId then return s.towerId end
+    local snap = snapshotTowers()
+    local used = {}
+    for _, sp in ipairs(spots) do
+        if sp.towerId then used[sp.towerId] = true end
+    end
+    local ground = s.pos - Vector3.new(0, settings.groundOffset, 0)
+    local best, bestScore
+    for _, t in ipairs(snap) do
+        if not used[t.id] then
+            local d = Vector3.new(t.pos.X - ground.X, 0, t.pos.Z - ground.Z).Magnitude
+            if d <= settings.matchRadius then
+                local score = d + (t.mine and 0 or 100)
+                if not bestScore or score < bestScore then best, bestScore = t, score end
+            end
+        end
+    end
+    if best then
+        s.towerId = best.id
+        return best.id
+    end
+    return nil
+end
+
+local function fireUpgrade(id, times)
+    local ok, err = pcall(function()
+        local node = game:GetService("ReplicatedStorage")
+        for _, n in ipairs(TOWER_UPGRADE_PATH) do
+            node = node:FindFirstChild(n)
+            if not node then error("missing " .. n) end
+        end
+        for _ = 1, times do
+            node:FireServer({ ["Id"] = id })
+            wait(0.1)
+        end
+    end)
+    if not ok and not upgradeWarned then
+        upgradeWarned = true
+        notify("TowerUpgrade remote failed (" .. tostring(err) .. "), upgrading by clicking instead", "CTD Macro", 6)
+    end
+    return ok
+end
+
+-- menu button: read the towers folder and report how many of your placed spots were matched
+local function scanTowers()
+    towerSnapAt = 0
+    if not towersFolder() then
+        notify("Couldn't find workspace.Game.Towers", "CTD Macro", 5)
+        return
+    end
+    for _, sp in ipairs(spots) do sp.towerId = nil end
+    local snap = snapshotTowers()
+    local matched, total = 0, 0
+    for _, sp in ipairs(spots) do
+        if sp.placed then
+            total = total + 1
+            if towerIdFor(sp) then matched = matched + 1 end
+        end
+    end
+    notify(string.format("%d towers read, %d of %d placed spots matched", #snap, matched, total), "CTD Macro", 6)
+end
+
+-- test buttons: one real remote call each, then tell you whether the game accepted it
+local function testRemotePlace(slot)
+    if not unitReady(slot) then
+        notify("Slot " .. slot .. " has no unit name / id yet", "CTD Macro", 5)
+        return
+    end
+    local hrp = myRoot()
+    if not hrp then notify("No character found", "CTD Macro", 3) return end
+    local before = getCash()
+    -- place it a few studs away so it isn't under your character
+    local spot = { slot = slot, pos = hrp.Position + Vector3.new(0, 0, 6) }
+    if not placeByRemote(spot) then return end -- it already told you why it failed
+    wait(1.2)
+    local after = getCash()
+    local cost = CFG.Costs[slot]
+    if before and after and cost and after <= before - cost * 0.5 then
+        notify(string.format("Remote placing WORKS: cash %d -> %d", before, after), "CTD Macro", 6)
+    elseif before and after then
+        notify(string.format("Call sent but cash didn't drop (%d -> %d): the server probably rejected it", before, after), "CTD Macro", 8)
+    else
+        notify("Call sent. Couldn't read your cash, so check the map for a new tower", "CTD Macro", 6)
+    end
+end
+
+local function testRemoteUpgrade()
+    local hrp = myRoot()
+    if not hrp then notify("No character found", "CTD Macro", 3) return end
+    towerSnapAt = 0
+    local snap = snapshotTowers()
+    local best, bestD
+    for _, t in ipairs(snap) do
+        local d = (t.pos - hrp.Position).Magnitude
+        if d < 25 and (not bestD or d < bestD) then best, bestD = t, d end
+    end
+    if not best then
+        notify("No tower within 25 studs of you (" .. #snap .. " towers read)", "CTD Macro", 5)
+        return
+    end
+    local before = getCash()
+    if not fireUpgrade(best.id, 1) then return end
+    wait(1.2)
+    local after = getCash()
+    if before and after and after < before then
+        notify(string.format("Remote upgrade WORKS: cash %d -> %d", before, after), "CTD Macro", 6)
+    else
+        notify("Upgrade sent for tower " .. tostring(best.id):sub(1, 8) .. ". Check whether it levelled up", "CTD Macro", 6)
+    end
+end
+
 local function upgradeSpot(s, times)
+    if USE_TOWER_REMOTES and settings.upgradeByRemote then
+        local id = towerIdFor(s)
+        if id and fireUpgrade(id, times) then return end
+    end
+    teleportToSpot(s)
     if clickWorld(s.pos) then
         wait(0.15)
         for _ = 1, times do
@@ -715,6 +1049,29 @@ local function firePlayAgain()
         notify("PlayAgain remote failed (" .. tostring(err) .. "), clicking the button instead", "CTD Macro", 6)
     end
     return ok
+end
+
+-- the end-of-round screen: game.Players.<you>.PlayerGui.GameUI.FinalUI.Content.PlayAgain.UI
+-- a direct path lookup is only a handful of memory reads, so it can be checked every half second
+local function finalScreenShown()
+    local node
+    pcall(function()
+        node = LocalPlayer:FindFirstChild("PlayerGui")
+        for _, name in ipairs({ "GameUI", "FinalUI", "Content", "PlayAgain", "UI" }) do
+            node = node and node:FindFirstChild(name)
+        end
+    end)
+    return node ~= nil and isShown(node)
+end
+
+-- same check for the menu, refreshed once a second, so you can see what the macro sees
+local finalText, finalTextAt = "", 0
+local function finalStateText()
+    if tick() - finalTextAt >= 1 then
+        finalTextAt = tick()
+        finalText = finalScreenShown() and "VISIBLE (round over)" or "hidden"
+    end
+    return finalText
 end
 
 -- game.Players.<you>.PlayerGui.GameUI.Stats.WaveSkipGui (the skip wave button)
@@ -952,12 +1309,21 @@ local function mainLoopBody()
         end
         if isrbxactive() then
             local btn = findReplayButton()
-            if btn then
-                status = "Replaying..."
+            -- "You Won!" in the middle of the screen means the round is over: replay right away
+            local won = false
+            -- not in the first 20 seconds of a round, so a screen left over from the last round can't trigger it
+            if settings.fireOnWin and tick() - lastWinFire > 30 and tick() - roundStart > 20 then
+                won = finalScreenShown()
+                    or (findGuiText(function(t) return t:find("you won", 1, true) ~= nil end) ~= nil)
+            end
+            if btn or won then
+                status = won and "You Won! - replaying..." or "Replaying..."
+                if won then lastWinFire = tick() end
                 stats.rounds = stats.rounds + 1
                 markProgress()
                 saveStats()
-                if not (settings.useReplayRemote and firePlayAgain()) then
+                local fired = settings.useReplayRemote and firePlayAgain()
+                if not fired and btn then
                     local p, s = btn.AbsolutePosition, btn.AbsoluteSize
                     clickAt(p.X + s.X / 2, p.Y + s.Y / 2 + settings.insetY)
                 end
@@ -1012,6 +1378,8 @@ local function mainLoopBody()
                     status = "Running"
                 end
             end
+        else
+            status = "Paused: click into the Roblox window (the macro only acts while it is focused)"
         end
         wait(0.5)
     end
@@ -1255,6 +1623,8 @@ UI.AddTab("CTD Macro", function(tab)
     end)
     main:Button(running and "Stop (F8)" or "Start (F8)", function() setRunning(not running) end)
     main:Text("Status: " .. status)
+    main:Text("Build: " .. BUILD)
+    main:Text("End screen: " .. finalStateText())
     do
         local up = math.floor(tick() - stats.startedAt)
         main:Text(string.format("Rounds: %d   Stuck fixes: %d   Retries: %d   Up: %dh %dm",
@@ -1298,6 +1668,49 @@ UI.AddTab("CTD Macro", function(tab)
     for i = 1, 5 do
         cnt:SliderInt("ctd_count_" .. i, "Slot " .. i, 1, 12, CFG.Counts[i] or 1, function(v) CFG.Counts[i] = v saveConfig() end)
     end
+
+    if USE_TOWER_REMOTES then
+    local pr = tab:Section("Place by remote (TowerAdd)", "Left")
+    pr:Toggle("ctd_place_remote", "Place with the TowerAdd remote", settings.placeByRemote, function(v)
+        if v ~= settings.placeByRemote then
+            settings.placeByRemote = v
+            saveConfig()
+        end
+    end)
+    pr:Text("TEST (stop the macro first):")
+    for i = 1, 5 do
+        pr:Button("Test place slot " .. i .. " (6 studs from you)", function() task.spawn(function() testRemotePlace(i) end) end)
+    end
+    pr:Button("Test upgrade nearest tower", function() task.spawn(testRemoteUpgrade) end)
+    pr:Toggle("ctd_upgrade_remote", "Upgrade with the TowerUpgrade remote", settings.upgradeByRemote, function(v)
+        if v ~= settings.upgradeByRemote then
+            settings.upgradeByRemote = v
+            saveConfig()
+        end
+    end)
+    pr:SliderFloat("ctd_match_radius", "Tower match radius (studs)", 0.5, 8.0, settings.matchRadius, "%.1f", function(v)
+        settings.matchRadius = v
+        saveConfig()
+    end)
+    pr:Button("Scan towers (check the match)", function() task.spawn(scanTowers) end)
+    pr:Text("Unit name + id per slot (empty = that slot is placed by clicking)")
+    for i = 1, 5 do
+        local nk, ik = "unit" .. i .. "Name", "unit" .. i .. "Id"
+        pr:InputText("ctd_unit_name_" .. i, "Slot " .. i .. " unit name", settings[nk], function(v)
+            if v ~= settings[nk] then
+                settings[nk] = v
+                saveConfig()
+            end
+        end)
+        pr:InputText("ctd_unit_id_" .. i, "Slot " .. i .. " unit id", settings[ik], function(v)
+            if v ~= settings[ik] then
+                settings[ik] = v
+                saveConfig()
+            end
+        end)
+    end
+
+    end -- USE_TOWER_REMOTES
 
     local mv = tab:Section("Mode vote", "Right")
     mv:Toggle("ctd_mode_vote", "Auto pick mode (click Vote)", settings.modeVoteEnabled, function(v)
@@ -1382,6 +1795,16 @@ UI.AddTab("CTD Macro", function(tab)
         saveConfig()
         notify("Teleport spot saved", "CTD Macro", 2)
     end)
+    tp:Toggle("ctd_tp_spot", "Teleport next to each spot before clicking", settings.tpToSpot, function(v)
+        if v ~= settings.tpToSpot then
+            settings.tpToSpot = v
+            saveConfig()
+        end
+    end)
+    tp:SliderInt("ctd_spot_standoff", "Stand this far behind the spot (studs)", 0, 15, settings.spotStandOff, function(v)
+        settings.spotStandOff = v
+        saveConfig()
+    end)
     tp:Button("Teleport now", function() task.spawn(teleportHome) end)
     tp:Toggle("ctd_tp_enabled", "Teleport there at round start", settings.tpEnabled, function(v)
         settings.tpEnabled = v
@@ -1400,6 +1823,12 @@ UI.AddTab("CTD Macro", function(tab)
     opt:Toggle("ctd_autospeed", "Auto 1.5x speed", settings.autoSpeed, function(v)
         settings.autoSpeed = v
         saveConfig()
+    end)
+    opt:Toggle("ctd_fire_on_win", "Replay when \"You Won!\" shows", settings.fireOnWin, function(v)
+        if v ~= settings.fireOnWin then
+            settings.fireOnWin = v
+            saveConfig()
+        end
     end)
     opt:SliderInt("ctd_start_delay", "Wait before auto-starting (s)", 0, 30, settings.startDelay, function(v) settings.startDelay = v saveConfig() end)
     opt:SliderInt("ctd_cam_delay", "Wait before camera change (s)", 0, 30, settings.camDelay, function(v) settings.camDelay = v saveConfig() end)
@@ -1440,7 +1869,7 @@ UI.AddTab("CTD Macro", function(tab)
     opt:SliderInt("ctd_inset", "Replay click offset Y (px)", 0, 80, settings.insetY, function(v) settings.insetY = v saveConfig() end)
 end)
 
-notify("Loaded " .. tostring(loadedCount) .. " saved spots. Open the CTD Macro tab to start.", "CTD Macro", 5)
+notify("Build " .. BUILD .. " - loaded " .. tostring(loadedCount) .. " saved spots. Open the CTD Macro tab to start.", "CTD Macro", 5)
 
 -- keep using it: resume automatically if auto-start is on
 -- and say why it did or didn't, so a missing auto-start is never a mystery
