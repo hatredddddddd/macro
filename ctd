@@ -7,7 +7,7 @@
 --
 -- "Towers per click" sliders set how many towers each button records (slot 1 = 9, slot 5 = 2).
 
-local BUILD = "2026-11-05 tp-to-spot v3 (light UI checks)" -- shown in the menu and the load message, so you can tell which copy is running
+local BUILD = "2026-11-05 tp-to-spot v2" -- shown in the menu and the load message, so you can tell which copy is running
 
 local Players = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
@@ -59,8 +59,6 @@ local settings = {
     stuckSecs = 240,      -- no progress (cash change, placement, vote, replay) for this long = stuck, force a replay (0 = off)
     antiIdle = true,      -- tiny mouse wiggle every 2 minutes so Roblox never counts you as idle
     placeVerify = true,   -- check that cash dropped after a placement and retry it if it didn't
-    fireOnWin = true,     -- fire the PlayAgain remote as soon as "You Won!" shows on screen
-    scanFallback = false, -- also search the whole UI by text for replay / "You Won!" / skip (slow, off by default)
     placeByRemote = true, -- place towers with the game's TowerAdd remote (falls back to clicking if that fails)
     upgradeByRemote = true, -- upgrade with the TowerUpgrade remote (falls back to click + upgrade key)
     matchRadius = 2.5,    -- studs: how close a tower in workspace.Game.Towers must be to a spot to count as that spot's tower
@@ -103,7 +101,6 @@ local stats = { rounds = 0, stuck = 0, retries = 0, startedAt = tick() }
 local lastProgress = tick()   -- last time anything useful happened (cash moved, tower placed, vote, replay)
 local lastIdle = tick()       -- last anti-idle wiggle
 local lastCashSeen = nil      -- last cash value the watchdog saw
-local lastWinFire = 0         -- when "You Won!" last triggered a replay (so it can't fire twice for one win)
 local function markProgress() lastProgress = tick() end
 local function saveStats()
     local secs = math.floor(tick() - stats.startedAt)
@@ -894,23 +891,15 @@ end
 
 ---------------------------------------------------------------- main loop
 -- find a visible GUI element whose (lowercased) text satisfies matchFn
--- is this element really on screen? walks up through its parents, and stops at the ScreenGui
--- (going further up only reads game objects that can't be hidden)
 local function isShown(d)
     local node = d
     for _ = 1, 12 do
         if not node then break end
-        local hidden, isScreen = false, false
-        pcall(function()
-            if node:IsA("GuiObject") then
-                hidden = not node.Visible
-            else
-                isScreen = true
-                hidden = node.Enabled == false
-            end
+        local ok, hidden = pcall(function()
+            if node:IsA("GuiObject") then return not node.Visible end
+            return node.Enabled == false
         end)
-        if hidden then return false end
-        if isScreen then break end
+        if ok and hidden then return false end
         node = node.Parent
     end
     return true
@@ -919,7 +908,7 @@ end
 -- Walking the whole GUI tree is the heaviest thing this script does, and it reads Roblox's
 -- memory from outside. So it is done at most once every few seconds and shared by every
 -- feature (replay, skip, speed, vote, round start clicks) instead of once per feature per loop.
-local SNAPSHOT_EVERY = 6
+local SNAPSHOT_EVERY = 4
 local guiSnap, guiSnapAt = {}, 0
 
 local function snapshotGui()
@@ -946,69 +935,23 @@ local function snapshotGui()
     return list
 end
 
--- look for a visible element by its text. with a key, an element found once is remembered and
--- re-checked directly afterwards (a couple of reads) instead of searching the whole UI again.
-local findCache, findCacheAt = {}, {}
-local function findGuiText(matchFn, key)
-    if key then
-        local c = findCache[key]
-        if c then
-            local ok, hit = pcall(function()
-                local t = c.Text
-                return type(t) == "string" and matchFn(string.lower(t))
-            end)
-            if ok and hit then
-                if isShown(c) then return c end
-                if tick() - (findCacheAt[key] or 0) < 10 then return nil end
-                -- hidden for a while: another copy of it may be the one showing, so look again
-            else
-                findCache[key] = nil -- the element is gone or changed
-            end
-        end
-    end
-    local firstMatch
+local function findGuiText(matchFn)
     for _, entry in ipairs(snapshotGui()) do
-        local ok, matched, shown = pcall(function()
-            if not matchFn(entry.text) then return false, false end
-            return true, isShown(entry.obj)
+        local ok, hit = pcall(function()
+            return matchFn(entry.text) and isShown(entry.obj)
         end)
-        if ok and matched then
-            firstMatch = firstMatch or entry.obj
-            if shown then
-                if key then findCache[key] = entry.obj findCacheAt[key] = tick() end
-                return entry.obj
-            end
-        end
+        if ok and hit then return entry.obj end
     end
-    if key and firstMatch then findCache[key] = firstMatch findCacheAt[key] = tick() end
     return nil
-end
-
--- the end-of-round screen, by its exact path (cheap): PlayerGui.GameUI.FinalUI.Content.PlayAgain.UI
-local function getFinalNode()
-    local node
-    pcall(function()
-        node = LocalPlayer:FindFirstChild("PlayerGui")
-        for _, name in ipairs({ "GameUI", "FinalUI", "Content", "PlayAgain", "UI" }) do
-            node = node and node:FindFirstChild(name)
-        end
-    end)
-    return node
 end
 
 local function findReplayButton()
-    local n = getFinalNode()
-    if n and isShown(n) then return n end
-    -- searching the whole UI for a replay button is the slow way, so it is off unless asked for
-    if settings.scanFallback then
-        return findGuiText(function(t)
-            for _, w in ipairs(CFG.ReplayWords) do
-                if t:find(w, 1, true) then return true end
-            end
-            return false
-        end, "replay")
-    end
-    return nil
+    return findGuiText(function(t)
+        for _, w in ipairs(CFG.ReplayWords) do
+            if t:find(w, 1, true) then return true end
+        end
+        return false
+    end)
 end
 
 local function clickGui(d)
@@ -1051,7 +994,7 @@ local function fireModeVote(force)
         if not settings.modeVoteEnabled then return false end
         if tick() - lastVoteTry < 2 then return false end
         lastVoteTry = tick()
-        local b = findGuiText(function(t) return t:match("^%s*vote%s*$") ~= nil end, "vote")
+        local b = findGuiText(function(t) return t:match("^%s*vote%s*$") ~= nil end)
         if not b then
             -- never saw a Vote button: after a while click the spot anyway (a stray click in a
             -- running match does nothing harmful), otherwise keep waiting for the screen
@@ -1104,23 +1047,6 @@ local function firePlayAgain()
         notify("PlayAgain remote failed (" .. tostring(err) .. "), clicking the button instead", "CTD Macro", 6)
     end
     return ok
-end
-
--- the end-of-round screen: game.Players.<you>.PlayerGui.GameUI.FinalUI.Content.PlayAgain.UI
--- a direct path lookup is only a handful of memory reads, so it can be checked every half second
-local function finalScreenShown()
-    local node = getFinalNode()
-    return node ~= nil and isShown(node)
-end
-
--- same check for the menu, refreshed once a second, so you can see what the macro sees
-local finalText, finalTextAt = "", 0
-local function finalStateText()
-    if tick() - finalTextAt >= 1 then
-        finalTextAt = tick()
-        finalText = finalScreenShown() and "VISIBLE (round over)" or "hidden"
-    end
-    return finalText
 end
 
 -- game.Players.<you>.PlayerGui.GameUI.Stats.WaveSkipGui (the skip wave button)
@@ -1188,10 +1114,7 @@ local function autoUtilities()
     -- skip wave
     if settings.autoSkip and tick() - lastSkip >= settings.skipEvery then
         lastSkip = tick()
-        local b = getWaveSkipButton()
-        if not b and settings.scanFallback then
-            b = findGuiText(function(t) return t:find("skip", 1, true) ~= nil end, "skip")
-        end
+        local b = getWaveSkipButton() or findGuiText(function(t) return t:find("skip", 1, true) ~= nil end)
         if b then
             status = "Skipping wave"
             clickGui(b)
@@ -1248,7 +1171,7 @@ local function runRoundStartClicks(force)
             local needle = string.lower(c.text)
             local b
             for _ = 1, 10 do -- wait up to ~5s for the button to appear
-                b = findGuiText(function(t) return t:find(needle, 1, true) ~= nil end, "click:" .. needle)
+                b = findGuiText(function(t) return t:find(needle, 1, true) ~= nil end)
                 if b or (not force and not running) then break end
                 wait(0.5)
             end
@@ -1293,11 +1216,7 @@ local function mainLoopBody()
         end)
         -- a Vote button appearing means a new match is starting. this re-arms everything even
         -- if the server change itself was never detected
-        -- the vote screen only shows at the start of a round, so don't look for it mid-match
-        local votePresent = false
-        if tick() - roundStart < 120 or votePrev then
-            votePresent = findGuiText(function(t) return t:match("^%s*vote%s*$") ~= nil end, "vote") ~= nil
-        end
+        local votePresent = findGuiText(function(t) return t:match("^%s*vote%s*$") ~= nil end) ~= nil
         if votePresent and not votePrev then
             votePresentSince = tick()
             roundStart = tick()
@@ -1365,22 +1284,12 @@ local function mainLoopBody()
         end
         if isrbxactive() then
             local btn = findReplayButton()
-            -- "You Won!" in the middle of the screen means the round is over: replay right away
-            local won = false
-            -- not in the first 20 seconds of a round, so a screen left over from the last round can't trigger it
-            if settings.fireOnWin and tick() - lastWinFire > 30 and tick() - roundStart > 20 then
-                won = finalScreenShown()
-                    or (settings.scanFallback
-                        and findGuiText(function(t) return t:find("you won", 1, true) ~= nil end, "youwon") ~= nil)
-            end
-            if btn or won then
-                status = won and "You Won! - replaying..." or "Replaying..."
-                if won then lastWinFire = tick() end
+            if btn then
+                status = "Replaying..."
                 stats.rounds = stats.rounds + 1
                 markProgress()
                 saveStats()
-                local fired = settings.useReplayRemote and firePlayAgain()
-                if not fired and btn then
+                if not (settings.useReplayRemote and firePlayAgain()) then
                     local p, s = btn.AbsolutePosition, btn.AbsoluteSize
                     clickAt(p.X + s.X / 2, p.Y + s.Y / 2 + settings.insetY)
                 end
@@ -1681,7 +1590,6 @@ UI.AddTab("CTD Macro", function(tab)
     main:Button(running and "Stop (F8)" or "Start (F8)", function() setRunning(not running) end)
     main:Text("Status: " .. status)
     main:Text("Build: " .. BUILD)
-    main:Text("End screen: " .. finalStateText())
     do
         local up = math.floor(tick() - stats.startedAt)
         main:Text(string.format("Rounds: %d   Stuck fixes: %d   Retries: %d   Up: %dh %dm",
@@ -1880,18 +1788,6 @@ UI.AddTab("CTD Macro", function(tab)
     opt:Toggle("ctd_autospeed", "Auto 1.5x speed", settings.autoSpeed, function(v)
         settings.autoSpeed = v
         saveConfig()
-    end)
-    opt:Toggle("ctd_fire_on_win", "Replay when \"You Won!\" shows", settings.fireOnWin, function(v)
-        if v ~= settings.fireOnWin then
-            settings.fireOnWin = v
-            saveConfig()
-        end
-    end)
-    opt:Toggle("ctd_scan_fallback", "Search whole UI as fallback (slower)", settings.scanFallback, function(v)
-        if v ~= settings.scanFallback then
-            settings.scanFallback = v
-            saveConfig()
-        end
     end)
     opt:SliderInt("ctd_start_delay", "Wait before auto-starting (s)", 0, 30, settings.startDelay, function(v) settings.startDelay = v saveConfig() end)
     opt:SliderInt("ctd_cam_delay", "Wait before camera change (s)", 0, 30, settings.camDelay, function(v) settings.camDelay = v saveConfig() end)
